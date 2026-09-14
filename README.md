@@ -6,6 +6,8 @@ server and downloads ebooks straight to your e-reader.
 A book you can find in Audiobookshelf, you can find and download on the reader —
 and once it lands, its metadata matches what Audiobookshelf says.
 
+Originally inspired by [naleo's Audiobookshelf plugin for KOReader](https://github.com/naleo/audiobookshelf.koplugin).
+
 ## Requirements
 
 - KOReader (2025 or newer)

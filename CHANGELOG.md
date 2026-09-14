@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+- Credit naleo's Audiobookshelf plugin for KOReader as the original inspiration
+  in the README.
+
 ## 0.1.5
 
 - Replaced the hamburger menu with a Storefront-style header showing the
