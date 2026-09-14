@@ -109,22 +109,47 @@ end
 -- Returns the cover image, or a framed placeholder. A missing cover is normal
 -- (not every library item has one) and per OD-2 must never surface as an
 -- error, so the fallback is silent.
+--
+-- Only book rows have a cover to fetch. Search results mix in authors and
+-- series whose ids address different endpoints entirely, so they go straight
+-- to the placeholder rather than spending a blocking request on a request that
+-- would 404.
 function CoverTile:buildCover(width, height)
-    local ok, image = pcall(function()
-        return CoverCache:get(self.entry.id, width, height)
-    end)
-    if ok and image then
-        return ImageWidget:new{
-            image = image,
-            width = width,
-            height = height,
-            -- the BlitBuffer came from the cache decode and belongs to this
-            -- widget now; let it be freed when the tile goes away
-            image_disposable = true,
-        }
+    if self.entry.type == "book" then
+        local ok, image = pcall(function()
+            return CoverCache:get(self.entry.id, width, height)
+        end)
+        if ok and image then
+            return ImageWidget:new{
+                image = image,
+                width = width,
+                height = height,
+                -- the BlitBuffer came from the cache decode and belongs to
+                -- this widget now; let it be freed when the tile goes away
+                image_disposable = true,
+            }
+        end
+        if not ok then
+            logger.warn("CoverGrid: cover fetch failed for", self.entry.id, image)
+        end
     end
-    if not ok then
-        logger.warn("CoverGrid: cover fetch failed for", self.entry.id, image)
+    local inner_w = width - 2 * Size.padding.small
+    local label = VerticalGroup:new{ align = "center" }
+    table.insert(label, TextBoxWidget:new{
+        text = self.entry.text or "",
+        face = Font:getFace("infont", 14),
+        width = inner_w,
+        alignment = "center",
+    })
+    -- Authors and series carry their kind in `mandatory`; without it a bare
+    -- name in a box gives no clue what tapping it does.
+    if self.entry.type ~= "book" and self.entry.mandatory then
+        table.insert(label, TextBoxWidget:new{
+            text = self.entry.mandatory,
+            face = Font:getFace("infont", 12),
+            width = inner_w,
+            alignment = "center",
+        })
     end
     return FrameContainer:new{
         width = width,
@@ -133,14 +158,8 @@ function CoverTile:buildCover(width, height)
         color = Blitbuffer.COLOR_GRAY,
         padding = Size.padding.small,
         CenterContainer:new{
-            dimen = Geom:new{ w = width - 2 * Size.padding.small,
-                             h = height - 2 * Size.padding.small },
-            TextBoxWidget:new{
-                text = self.entry.text or "",
-                face = Font:getFace("infont", 14),
-                width = width - 2 * Size.padding.small,
-                alignment = "center",
-            },
+            dimen = Geom:new{ w = inner_w, h = height - 2 * Size.padding.small },
+            label,
         },
     }
 end
@@ -162,6 +181,56 @@ function CoverTile:onTapSelect()
     return true
 end
 
+-- How many covers on this page still need fetching. Only book rows have one,
+-- and isCached is a stat call, so this is cheap relative to the fetches it is
+-- deciding whether to warn about.
+function CoverGrid.countUncached(menu, idx_offset, perpage)
+    local pending = 0
+    for idx = 1, perpage do
+        local item = menu.item_table[idx_offset + idx]
+        if item and item.type == "book" and not CoverCache:isCached(item.id) then
+            pending = pending + 1
+        end
+    end
+    return pending
+end
+
+-- forceRePaint is what actually gets the message on screen: the fetches that
+-- follow run on the same thread, so without it the notice would not paint
+-- until after the work it is announcing had finished.
+--
+-- Wrapped in pcall throughout. A notice is a courtesy -- it must never be the
+-- reason a page fails to draw.
+function CoverGrid.showLoading(pending)
+    if pending <= 0 then
+        return nil
+    end
+    local ok, notice = pcall(function()
+        local InfoMessage = require("ui/widget/infomessage")
+        local _ = require("gettext")
+        local T = require("ffi/util").template
+        local msg = InfoMessage:new{
+            text = pending == 1 and _("Loading cover…")
+                or T(_("Loading %1 covers…"), pending),
+        }
+        UIManager:show(msg)
+        UIManager:forceRePaint()
+        return msg
+    end)
+    if not ok then
+        logger.warn("CoverGrid: could not show loading notice:", notice)
+        return nil
+    end
+    return notice
+end
+
+function CoverGrid.hideLoading(notice)
+    if not notice then
+        return
+    end
+    pcall(function() UIManager:close(notice) end)
+end
+
 -- Grid replacement for Menu:updateItems. Mirrors that method's contract --
 -- reset layout and groups, recalculate dimensions, build the page, then
 -- updatePageInfo / mergeTitleBarIntoLayout / setDirty -- so paging, the page
@@ -181,6 +250,12 @@ function CoverGrid.updateItems(menu, select_number, no_recalculate_dimen)
     local idx_offset = (menu.page - 1) * perpage
     local tile_w = math.floor(menu.inner_dimen.w / cols)
     local tile_h = math.floor(menu.available_height / rows)
+
+    -- Building the tiles below blocks on one HTTP request per uncached cover.
+    -- Announce it first, but only when there is actually something to fetch --
+    -- a cached page draws immediately and a flashed message would be noise.
+    local pending = CoverGrid.countUncached(menu, idx_offset, perpage)
+    local notice = CoverGrid.showLoading(pending)
 
     for row = 1, rows do
         local row_group = HorizontalGroup:new{}
@@ -212,6 +287,8 @@ function CoverGrid.updateItems(menu, select_number, no_recalculate_dimen)
             table.insert(menu.layout, row_layout)
         end
     end
+
+    CoverGrid.hideLoading(notice)
 
     menu:updatePageInfo(select_number)
     menu:mergeTitleBarIntoLayout()
