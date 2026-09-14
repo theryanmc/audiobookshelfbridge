@@ -1,4 +1,4 @@
-local AudiobookshelfApi = require("audiobookshelfbridge/audiobookshelfbridgeapi")
+local AudiobookshelfApi = require("audiobookshelfbridge/api")
 local DataStorage = require("datastorage")
 local RenderImage = require("ui/renderimage")
 local lfs = require("libs/libkoreader-lfs")

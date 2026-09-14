@@ -1,6 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
-local EbookFileWidget = require("audiobookshelfbridge/audiobookshelfbridgeebookfilewidget")
+local EbookFileWidget = require("audiobookshelfbridge/ebookfilewidget")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local FocusManager = require("ui/widget/focusmanager")
 local Font = require("ui/font")
@@ -24,7 +24,7 @@ local Device = require("device")
 local Screen = Device.screen
 
 local Event = require("ui/event")
-local AudiobookshelfApi = require("audiobookshelfbridge/audiobookshelfbridgeapi")
+local AudiobookshelfApi = require("audiobookshelfbridge/api")
 local InfoMessage = require("ui/widget/infomessage")
 local _ = require("gettext")
 

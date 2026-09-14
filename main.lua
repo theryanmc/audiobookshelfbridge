@@ -1,10 +1,8 @@
-local Dispatcher = require("dispatcher")
-local AudiobookshelfBrowser = require("audiobookshelfbridge/audiobookshelfbridgebrowser")
+local AudiobookshelfBrowser = require("audiobookshelfbridge/browser")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
-local logger = require("logger")
 
 -- Shared by the menu_items key and the menu order tables below; the sorter
 -- matches one against the other, so they must not drift apart.
@@ -51,12 +49,7 @@ local function injectIntoToolsMenu()
     end
 end
 
-function Audiobookshelf:onDispatcherRegisterActions()
-    -- none atm
-end
-
 function Audiobookshelf:init()
-    self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
 

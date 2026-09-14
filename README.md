@@ -143,6 +143,22 @@ Things worth knowing before you point this at a server you care about.
   Recent errors list is built to never contain a token, header, or response
   body.
 
+## Development and releases
+
+The root contains KOReader's entry points (`main.lua` and `_meta.lua`), the
+version file, and the example configuration. Runtime modules live in
+`audiobookshelfbridge/`; screenshots live in `docs/screenshots/`.
+
+Run `python3 scripts/package_release.py` to build
+`dist/audiobookshelfbridge.koplugin.zip`. The script packages only explicitly
+listed files and checks that internal imports are included. When adding a
+runtime module, also add it to the script's file list.
+
+`audiobookshelfbridge_version.lua` is the release version's single source of
+truth. To release, update it and `CHANGELOG.md`, then push to `main`. CI builds
+the archive and publishes the matching `vMAJOR.MINOR.PATCH` tag. If that tag
+already exists, CI validates the package without publishing another release.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

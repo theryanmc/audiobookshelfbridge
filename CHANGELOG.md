@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Shortened runtime module filenames and updated all internal imports.
+- Removed unused imports and dispatcher scaffolding from the plugin entry point.
+- Package releases from an explicit file list, checking that internal imports
+  are included and keeping local configuration and development files out.
+- Use the Lua version file as the single source for release tags; existing
+  versions are validated without publishing another release.
+- Documented the project layout and local packaging and release process.
+
 ## 0.1.6
 
 - Credit naleo's Audiobookshelf plugin for KOReader as the original inspiration

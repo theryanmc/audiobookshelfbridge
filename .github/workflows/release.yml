@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+concurrency:
+  group: releases
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -16,56 +21,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Bump version and push tag
-        id: tag_version
-        uses: mathieudutour/github-tag-action@v6.2
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: patch
-          release_branches: main
+      - name: Build release archive
+        run: python3 scripts/package_release.py
 
-      - name: Zip release
-        # KOReader only loads plugin directories whose name ends in .koplugin
-        # (pluginloader.lua: entry:sub(-9) == ".koplugin"). Zipping the checkout
-        # directly packaged it under the repository name, so the archive
-        # unpacked to a folder KOReader silently ignored. Stage the files under
-        # the required name first, then zip that.
+      - name: Check version tag
+        id: version
         run: |
-          mkdir -p dist/audiobookshelfbridge.koplugin
-          rsync -a \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='dist/' \
-            --exclude='docs/' \
-            --exclude='.planning/' \
-            --exclude='.gsd/' \
-            --exclude='spec/' \
-            --exclude='lua_modules/' \
-            --exclude='.luarocks/' \
-            --exclude='.tool-versions' \
-            --exclude='*.rockspec' \
-            --exclude='*.zip' \
-            --exclude='.gitignore' \
-            --exclude='*.old' \
-            --exclude='audiobookshelf_config.lua' \
-            --exclude='audiobookshelfbridge_config.lua' \
-            ./ dist/audiobookshelfbridge.koplugin/
-          cd dist && zip -r ../audiobookshelfbridge.koplugin.zip audiobookshelfbridge.koplugin
-          cd ..
-          # rsync does not honour .gitignore, so a local run of this recipe
-          # would otherwise sweep a real audiobookshelfbridge_config.lua -- and
-          # the server URL and API token in it -- into a public archive. CI
-          # checks out a clean tree, but fail loudly rather than depend on that.
-          if unzip -l audiobookshelfbridge.koplugin.zip | grep -qE '(^|/)audiobookshelf(bridge)?_config\.lua$'; then
-            echo "::error::Real config file found in release archive - refusing to publish"
-            exit 1
+          tag="v$(python3 scripts/package_release.py --version)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "$tag already exists; bump audiobookshelfbridge_version.lua to publish a new release."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
-          unzip -l audiobookshelfbridge.koplugin.zip
 
       - name: Release
+        if: steps.version.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag_version.outputs.new_tag }}
-          name: Release ${{ steps.tag_version.outputs.new_tag }}
-          body: ${{ steps.tag_version.outputs.changelog }}
-          files: audiobookshelfbridge.koplugin.zip
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Release ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/audiobookshelfbridge.koplugin.zip

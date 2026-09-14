@@ -1,6 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
-local CoverCache = require("audiobookshelfbridge/audiobookshelfbridgecovercache")
+local CoverCache = require("audiobookshelfbridge/covercache")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")

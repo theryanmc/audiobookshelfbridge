@@ -9,10 +9,10 @@ local logger = require("logger")
 local RenderImage = require("ui/renderimage")
 local util = require("util")
 
-local Settings = require("audiobookshelfbridge/audiobookshelfbridgesettings")
+local Settings = require("audiobookshelfbridge/settings")
 local VERSION = require("audiobookshelfbridge_version")
-local ErrorLog = require("audiobookshelfbridge/audiobookshelfbridgeerrorlog")
-local DownloadStaging = require("audiobookshelfbridge/audiobookshelfbridgedownloadstaging")
+local ErrorLog = require("audiobookshelfbridge/errorlog")
+local DownloadStaging = require("audiobookshelfbridge/downloadstaging")
 local _ = require("gettext")
 
 -- D-07: raised per-group /search limit. ABS defaults this to 12 per group,

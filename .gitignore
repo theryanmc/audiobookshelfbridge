@@ -12,3 +12,5 @@ audiobookshelfbridge_config.lua
 
 # Build artifacts
 *.koplugin.zip
+dist/
+__pycache__/

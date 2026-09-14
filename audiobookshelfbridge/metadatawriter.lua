@@ -1,4 +1,4 @@
-local AudiobookshelfApi = require("audiobookshelfbridge/audiobookshelfbridgeapi")
+local AudiobookshelfApi = require("audiobookshelfbridge/api")
 local DataStorage = require("datastorage")
 local DocSettings = require("docsettings")
 local Event = require("ui/event")
