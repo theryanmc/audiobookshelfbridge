@@ -44,8 +44,8 @@ Treat the token like a password: it grants access to your library.
 
 ## Configure
 
-Open **Tools → Audiobookshelf Bridge**, then the **☰** menu in the top left and
-choose **Settings**.
+Open **Tools → Audiobookshelf Bridge**, then tap the **Settings** gear in the
+top right.
 
 ![The plugin's settings screen](docs/screenshots/settings.png)
 
@@ -91,14 +91,19 @@ publish or share.
 Pick a library, and its books appear as cover tiles. Tap one for its details,
 then choose a file to download.
 
+If only one library is enabled, the browser opens it directly. The X button
+then closes the plugin from that library's book list.
+
 | Control | Action |
 |---------|--------|
-| **☰** (top left) | Search this library, or open Settings |
+| **Search** (magnifying glass, top right) | Search this library |
+| **Settings** (gear, top right) | Open Settings |
 | **✕** (top right) | Back one level; closes the plugin at the top level |
 | Multi-swipe | Closes the browser from any depth |
 
-Search is scoped to the library you are in, so it only appears in the ☰ menu
-once you have opened one. Results list matching authors and series alongside
+The header keeps the plugin name on the left, with the current location below it.
+Search is scoped to the library you are in and only appears once you have opened
+one. Results list matching authors and series alongside
 books.
 
 ## Notes

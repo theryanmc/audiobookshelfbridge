@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5
+
+- Replaced the hamburger menu with a Storefront-style header showing the
+  plugin name, current location, and direct Settings and X buttons.
+- Added a dedicated Search button that only appears inside a library.
+- Automatically open the book list when exactly one library is enabled.
+  X exits from that list; deeper screens still go back one level.
+- Keep the library picker available if loading the single library fails.
+
 ## 0.1.4
 
 Security hardening following a full audit.

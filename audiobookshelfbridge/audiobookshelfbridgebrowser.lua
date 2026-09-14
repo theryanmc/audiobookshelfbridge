@@ -1,6 +1,6 @@
 local AudiobookshelfApi = require("audiobookshelfbridge/audiobookshelfbridgeapi")
 local BookDetailsWidget = require("audiobookshelfbridge/audiobookshelfbridgebookdetailswidget")
-local ButtonDialog = require("ui/widget/buttondialog")
+local BrowserTitleBar = require("audiobookshelfbridge/audiobookshelfbridgetitlebar")
 local CoverGrid = require("audiobookshelfbridge/audiobookshelfbridgecovergrid")
 local InfoMessage = require("ui/widget/infomessage")
 local logger = require("logger")
@@ -57,10 +57,9 @@ end
 
 local AudiobookshelfBrowser = Menu:extend{
     no_title = false,
-    title = _("Audiobookshelf Browser"),
+    title = _("Audiobookshelf Bridge"),
     is_popout = false,
     is_borderless = true,
-    title_bar_left_icon = "appbar.menu",
     show_parent = nil
 }
 
@@ -76,49 +75,26 @@ function AudiobookshelfBrowser:init()
     else
         self.item_table = self:genItemTableFromLibraries()
     end
+    self.custom_title_bar = BrowserTitleBar:new{
+        width = self.width or require("device").screen:getWidth(),
+        browser = self,
+    }
     Menu.init(self)
+    -- The library rows already exclude libraries disabled in Settings.
+    -- Initialize Menu first so the normal loader can update its title and grid.
+    if not self.item and #self.item_table == 1 and self.item_table[1].type == "library" then
+        local library = self.item_table[1]
+        if self:openLibrary(library.id, library.text) then
+            -- Make this library the navigation root. A failed load leaves the
+            -- picker available for retrying or opening Settings.
+            table.remove(self.item_table_stack)
+        end
+    end
 end
 
--- The title bar has exactly two icon slots, and the right one is spoken for:
--- Menu wires it to close_callback -> onClose, which under D-01 means "up one
--- level, or tear down at the root". It is the back button AND the way out, so
--- it cannot be repurposed -- doing so removed both at once.
---
--- That leaves one slot for both settings and search. A menu behind it is how
--- KOReader's own OPDS browser resolves the same squeeze (opdsbrowser.lua:90 --
--- appbar.menu opening a ButtonDialog that holds Search), so this follows that
--- precedent rather than inventing a third convention.
+-- Also used by Menu's hardware menu-key handler.
 function AudiobookshelfBrowser:onLeftButtonTap()
-    local dialog
-    local buttons = {}
-
-    -- Search is library-scoped: loadLibrarySearch runs against self.library_id.
-    -- At the top level there is no library to scope to, so the row is simply
-    -- absent rather than present-and-failing.
-    if self.library_id then
-        table.insert(buttons, {{
-            text = _("Search this library"),
-            align = "left",
-            callback = function()
-                UIManager:close(dialog)
-                -- No wake here: this only opens the input dialog and makes no
-                -- request. The request happens later, in search() (D-14).
-                self:ShowSearch()
-            end,
-        }})
-    end
-
-    table.insert(buttons, {{
-        text = _("Settings"),
-        align = "left",
-        callback = function()
-            UIManager:close(dialog)
-            UIManager:show(SettingsMenu:new{})
-        end,
-    }})
-
-    dialog = ButtonDialog:new{ buttons = buttons }
-    UIManager:show(dialog)
+    UIManager:show(SettingsMenu:new{})
 end
 
 -- Cover tiles apply to any level that contains at least one book.
