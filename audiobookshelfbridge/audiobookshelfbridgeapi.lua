@@ -63,6 +63,71 @@ end
 
 local AudiobookshelfApi = {}
 
+local USER_AGENT = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, "."))
+
+-- S1: the single place credentials are read. On a fresh install the config
+-- file does not exist, LuaSettings hands back an empty table, and both reads
+-- return nil. Every request used to concatenate those values outside its
+-- pcall, so the first tap on the plugin raised "attempt to concatenate a nil
+-- value" and took KOReader down -- before the user could ever reach Settings
+-- to fix it. Returns nil when either value is missing; callers turn that into
+-- an "unconfigured" result the browser routes to Settings.
+local function credentials()
+    local server = Settings:read("server")
+    local token = Settings:read("token")
+    if type(server) ~= "string" or server == "" or type(token) ~= "string" or token == "" then
+        return nil
+    end
+    return server, token
+end
+
+function AudiobookshelfApi:isConfigured()
+    return credentials() ~= nil
+end
+
+-- S2: `redirect = false`. LuaSocket follows up to five redirects by default,
+-- and its tredirect copies the request headers verbatim to the new location
+-- (socket/http.lua) -- Authorization included. A captive-portal Wi-Fi that
+-- 302s every request to its sign-in page would be handed the API token. ABS
+-- /api endpoints never redirect, so a 3xx is a failure here, reported with a
+-- hint to check the URL or sign in to the network.
+--
+-- S7: `path` must already be percent-encoded by the caller. Ids and inos come
+-- from server responses and are placed into path segments, so they are encoded
+-- with util.urlEncode at the call site the same way author_id always was.
+local function buildRequest(server, token, path, sink)
+    return {
+        url = server .. path,
+        method = "GET",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+            ["User-Agent"] = USER_AGENT,
+        },
+        sink = sink,
+        redirect = false,
+    }
+end
+
+local function isRedirect(code)
+    return type(code) == "number" and code >= 300 and code < 400
+end
+
+-- The no-credentials and redirect exits, shared by every method below so the
+-- log line and Recent-errors entry read the same everywhere. No gettext here:
+-- callers shadow `_` as a pcall placeholder (the Phase 1 finding), so these
+-- strings match the existing non-translated ErrorLog style in this file.
+local function unconfigured(method_name)
+    logger.warn("AudiobookshelfApi: " .. method_name .. " called before server/token were configured")
+    return nil, "unconfigured"
+end
+
+local function redirected(method_name, code, status)
+    logger.warn("AudiobookshelfApi: server redirected in " .. method_name .. ":", status or code)
+    ErrorLog:record(T("%1: server redirected (%2). Check the server URL, or sign in to the Wi-Fi network.",
+        method_name, tostring(code)))
+    return nil, "redirect"
+end
+
 -- D-13: the one shared decode guard. Every JSON-decoding method routes
 -- through this so a malformed or empty response can never propagate as a
 -- throw (it indexes an error string) or as a silently-empty list. Placed
@@ -95,16 +160,12 @@ function AudiobookshelfApi:decodeResponse(response, method_name, key)
 end
 
 function AudiobookshelfApi:getLibraries()
+    local server, token = credentials()
+    if not server then
+        return unconfigured("getLibraries")
+    end
     local sink = {}
-    local request = {
-        url = Settings:read("server") .. "/api/libraries",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
+    local request = buildRequest(server, token, "/api/libraries", ltn12.sink.table(sink))
     socketutil:set_timeout()
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
@@ -113,6 +174,9 @@ function AudiobookshelfApi:getLibraries()
         logger.warn("AudiobookshelfApi: http request failed in getLibraries:", code)
         ErrorLog:record(T("getLibraries: connection failed: %1", tostring(code)))
         return nil, "connection"
+    end
+    if isRedirect(code) then
+        return redirected("getLibraries", code, status)
     end
     if code == 200 and response ~= "" then
         local result = self:decodeResponse(response, "getLibraries", "libraries")
@@ -126,40 +190,81 @@ function AudiobookshelfApi:getLibraries()
     return nil, "server"
 end
 
-function AudiobookshelfApi:getLibraryItems(id)
-    local sink = {}
-    -- this is "ebooks" base64 encoded, and the URL encoded, to only return library items with ebooks
-    local filters = "ebooks." .. "ZWJvb2s%3D"
-    local request = {
-        url = Settings:read("server") .. "/api/libraries/" .. id .. "/items?filter=" .. filters .. "&sort=media.metadata.title&limit=0",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
-    -- This is a limit=0 list call on possibly-weak Wi-Fi -- use the
-    -- large-content timeouts rather than the argument-less 5s/15s default.
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    local response = table.concat(sink)
-    socketutil:reset_timeout()
-    if not ok then
-        logger.warn("AudiobookshelfApi: http request failed in getLibraryItems:", code)
-        ErrorLog:record(T("getLibraryItems: connection failed: %1", tostring(code)))
-        return nil, "connection"
-    end
-    if code == 200 and response ~= "" then
-        local result = self:decodeResponse(response, "getLibraryItems", "results")
-        if not result then
+-- S8: page size for /items listings, and a hard stop on page count so a
+-- server that keeps returning full pages can never loop this forever.
+-- 100 is ABS's own web-client page size; 200 pages is 20,000 items.
+local ITEMS_PAGE_SIZE = 100
+local ITEMS_MAX_PAGES = 200
+
+-- S8: walks a /items listing page by page instead of asking for the whole
+-- library in one request with limit=0. A large library came back as a single
+-- response that had to be held and decoded in memory in one go, on a device
+-- with very little of it, with the UI stalled the entire time. Paging keeps
+-- each blocking request bounded; the server sorts globally, so pages compose
+-- into the same order limit=0 produced.
+--
+-- `base_path` is the encoded path plus its own query string, without limit or
+-- page. Stops when a page comes back short or the running total reaches the
+-- server's declared `total`. Same return contract as the single-request
+-- methods: the results array, or nil plus a reason.
+local function fetchAllPages(self, server, token, base_path, method_name)
+    local all = {}
+    for page = 0, ITEMS_MAX_PAGES - 1 do
+        local sink = {}
+        local request = buildRequest(server, token,
+            base_path .. "&limit=" .. ITEMS_PAGE_SIZE .. "&page=" .. page,
+            ltn12.sink.table(sink))
+        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
+        local response = table.concat(sink)
+        socketutil:reset_timeout()
+        if not ok then
+            logger.warn("AudiobookshelfApi: http request failed in " .. method_name .. ":", code)
+            ErrorLog:record(T("%1: connection failed: %2", method_name, tostring(code)))
+            return nil, "connection"
+        end
+        if isRedirect(code) then
+            return redirected(method_name, code, status)
+        end
+        if code ~= 200 or response == "" then
+            logger.warn("AudiobookshelfApi: " .. method_name .. " page", page, "failed:", status or code)
+            ErrorLog:record(T("%1: server error: %2", method_name, tostring(status or code)))
+            return nil, "server"
+        end
+        -- Whole object, not just `results`: `total` is needed to know when to
+        -- stop. The shape check on `results` mirrors decodeResponse's own
+        -- missing-field branch so a malformed page is reported the same way.
+        local decoded = self:decodeResponse(response, method_name)
+        if not decoded then
             return nil, "unreadable"
         end
-        return result
+        local results = decoded.results
+        if type(results) ~= "table" then
+            logger.warn("AudiobookshelfApi: missing expected field", method_name, "results")
+            ErrorLog:record(T("%1: missing expected field", method_name))
+            return nil, "unreadable"
+        end
+        for i = 1, #results do
+            all[#all + 1] = results[i]
+        end
+        local total = tonumber(decoded.total)
+        if #results < ITEMS_PAGE_SIZE or (total and #all >= total) then
+            break
+        end
     end
-    logger.warn("AudiobookshelfApi: cannot get library items for library", id ,status or code)
-    ErrorLog:record(T("getLibraryItems: server error: %1", tostring(status or code)))
-    return nil, "server"
+    return all
+end
+
+function AudiobookshelfApi:getLibraryItems(id)
+    local server, token = credentials()
+    if not server then
+        return unconfigured("getLibraryItems")
+    end
+    -- this is "ebooks" base64 encoded, and the URL encoded, to only return library items with ebooks
+    local filters = "ebooks." .. "ZWJvb2s%3D"
+    return fetchAllPages(self, server, token,
+        "/api/libraries/" .. util.urlEncode(id) .. "/items?filter=" .. filters .. "&sort=media.metadata.title",
+        "getLibraryItems")
 end
 
 -- D-17: the series drill-in's scoped call. `library_id` scopes the request by
@@ -170,45 +275,22 @@ end
 -- URL-decoding it, and util.urlEncode percent-encodes everything outside the
 -- unreserved set, so a server-supplied id containing an ampersand, a
 -- question mark, a hash, or a path-traversal sequence cannot escape the
--- query value (T-03-01). Deliberately sends no `sort` parameter: `limit=0`
--- returns the whole series and D-09's client-side comparator in the browser
--- is the single ordering authority (flagged assumption A-01). Deliberately
--- carries no `ebooks` filter term either -- ABS's `filter` parameter accepts
--- exactly one filter group per request, which is precisely why SRCH-07's
--- ebook test is applied client-side against the frame-cached snapshot.
+-- query value (T-03-01). Deliberately sends no `sort` parameter: the whole
+-- series is fetched (paged, see fetchAllPages) and D-09's client-side
+-- comparator in the browser is the single ordering authority (flagged
+-- assumption A-01). Deliberately carries no `ebooks` filter term either --
+-- ABS's `filter` parameter accepts exactly one filter group per request,
+-- which is precisely why SRCH-07's ebook test is applied client-side against
+-- the frame-cached snapshot.
 function AudiobookshelfApi:getSeriesItems(library_id, series_id)
-    local sink = {}
+    local server, token = credentials()
+    if not server then
+        return unconfigured("getSeriesItems")
+    end
     local filters = "series." .. util.urlEncode(sha2.bin_to_base64(series_id))
-    local request = {
-        url = Settings:read("server") .. "/api/libraries/" .. library_id .. "/items?filter=" .. filters .. "&limit=0",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
-    -- This is a limit=0 list call on possibly-weak Wi-Fi -- use the
-    -- large-content timeouts rather than the argument-less 5s/15s default.
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    local response = table.concat(sink)
-    socketutil:reset_timeout()
-    if not ok then
-        logger.warn("AudiobookshelfApi: http request failed in getSeriesItems:", code)
-        ErrorLog:record(T("getSeriesItems: connection failed: %1", tostring(code)))
-        return nil, "connection"
-    end
-    if code == 200 and response ~= "" then
-        local result = self:decodeResponse(response, "getSeriesItems", "results")
-        if not result then
-            return nil, "unreadable"
-        end
-        return result
-    end
-    logger.warn("AudiobookshelfApi: cannot get series items for series", series_id, status or code)
-    ErrorLog:record(T("getSeriesItems: server error: %1", tostring(status or code)))
-    return nil, "server"
+    return fetchAllPages(self, server, token,
+        "/api/libraries/" .. util.urlEncode(library_id) .. "/items?filter=" .. filters,
+        "getSeriesItems")
 end
 
 -- D-17: the author drill-in's scoped call, copying getLibraryItem's
@@ -222,16 +304,14 @@ end
 -- which this plan does not consume but which is cheap and keeps the
 -- option open without another endpoint change.
 function AudiobookshelfApi:getAuthorItems(author_id)
+    local server, token = credentials()
+    if not server then
+        return unconfigured("getAuthorItems")
+    end
     local sink = {}
-    local request = {
-        url = Settings:read("server") .. "/api/authors/" .. util.urlEncode(author_id) .. "?include=items,series",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
+    local request = buildRequest(server, token,
+        "/api/authors/" .. util.urlEncode(author_id) .. "?include=items,series",
+        ltn12.sink.table(sink))
     -- This endpoint takes no limit parameter -- bounded only by the
     -- author's whole bibliography -- so it belongs with the other
     -- unbounded list calls at the large-content timeouts rather than the
@@ -244,6 +324,9 @@ function AudiobookshelfApi:getAuthorItems(author_id)
         logger.warn("AudiobookshelfApi: http request failed in getAuthorItems:", code)
         ErrorLog:record(T("getAuthorItems: connection failed: %1", tostring(code)))
         return nil, "connection"
+    end
+    if isRedirect(code) then
+        return redirected("getAuthorItems", code, status)
     end
     if code == 200 and response ~= "" then
         -- Keyed on "libraryItems": when `items` is included the server
@@ -262,16 +345,14 @@ function AudiobookshelfApi:getAuthorItems(author_id)
 end
 
 function AudiobookshelfApi:getLibraryItem(id)
+    local server, token = credentials()
+    if not server then
+        return unconfigured("getLibraryItem")
+    end
     local sink = {}
-    local request = {
-        url = Settings:read("server") .. "/api/items/" .. id .. "?expanded=1",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
+    local request = buildRequest(server, token,
+        "/api/items/" .. util.urlEncode(id) .. "?expanded=1",
+        ltn12.sink.table(sink))
     socketutil:set_timeout()
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
@@ -280,6 +361,9 @@ function AudiobookshelfApi:getLibraryItem(id)
         logger.warn("AudiobookshelfApi: http request failed in getLibraryItem:", code)
         ErrorLog:record(T("getLibraryItem: connection failed: %1", tostring(code)))
         return nil, "connection"
+    end
+    if isRedirect(code) then
+        return redirected("getLibraryItem", code, status)
     end
     if code == 200 and response ~= "" then
         local result = self:decodeResponse(response, "getLibraryItem")
@@ -294,6 +378,13 @@ function AudiobookshelfApi:getLibraryItem(id)
 end
 
 function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
+    -- Before the staging file is opened, so an unconfigured plugin leaves
+    -- nothing behind on disk.
+    local server, token = credentials()
+    if not server then
+        unconfigured("downloadFile")
+        return false, "unconfigured"
+    end
     socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
     local fullpath = local_path .. "/" .. filename
     -- A-07 gap closure: the destination (fullpath) is never opened for
@@ -320,15 +411,9 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
         socketutil:reset_timeout()
         return false, "open_failed"
     end
-    local request = {
-        url = Settings:read("server") .. "/api/items/" .. id .. "/file/" .. ino .. "/download",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.file(outfile),
-    }
+    local request = buildRequest(server, token,
+        "/api/items/" .. util.urlEncode(id) .. "/file/" .. util.urlEncode(ino) .. "/download",
+        ltn12.sink.file(outfile))
     local ok, code, headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
     if not ok or code ~= 200 then
@@ -343,6 +428,10 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
         -- branch (A-07).
         pcall(function() outfile:close() end)
         DownloadStaging.discard(temp_path)
+        if ok and isRedirect(code) then
+            redirected("downloadFile", code, status)
+            return false, "redirect"
+        end
         logger.warn("AudiobookshelfApi: cannot download file:", id , ino, status or code)
         ErrorLog:record(T("downloadFile: transfer failed: %1", tostring(status or code)))
         return false, ok and tostring(status or code) or tostring(code)
@@ -393,16 +482,15 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
 end
 
 function AudiobookshelfApi:getLibraryItemCover(id)
+    local server, token = credentials()
+    if not server then
+        unconfigured("getLibraryItemCover")
+        return nil
+    end
     local sink = {}
-    local request = {
-        url = Settings:read("server") .. "/api/items/" .. id .. "/cover?format=webp",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
+    local request = buildRequest(server, token,
+        "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
+        ltn12.sink.table(sink))
     -- Same endpoint/headers as downloadCover, which correctly uses the
     -- larger file-transfer timeouts; align this call so the Book Details
     -- cover thumbnail doesn't time out sooner than the sidecar cover write.
@@ -413,6 +501,12 @@ function AudiobookshelfApi:getLibraryItemCover(id)
     if not ok then
         logger.warn("AudiobookshelfApi: http request failed in getLibraryItemCover:", code)
         ErrorLog:record(T("getLibraryItemCover: connection failed: %1", tostring(code)))
+        return nil
+    end
+    if isRedirect(code) then
+        -- logger only, no ErrorLog (OD-2): a cover that cannot be fetched
+        -- must never surface in Settings -> Recent errors.
+        logger.warn("AudiobookshelfApi: server redirected in getLibraryItemCover:", status or code)
         return nil
     end
     if code == 200 and response ~= "" then
@@ -430,9 +524,8 @@ end
 -- re-encoding back to webp is both lossy and unsolved in this codebase
 -- (META-03/META-04). Same URL, same headers as getLibraryItemCover.
 function AudiobookshelfApi:downloadCover(id, local_path)
-    local server = Settings:read("server")
-    local token = Settings:read("token")
-    if not server or server == "" or not token or token == "" then
+    local server, token = credentials()
+    if not server then
         -- Same guard testConnection uses, but no ErrorLog:record (OD-2): a
         -- missing/failed cover must never surface in Settings -> Recent
         -- errors, which is a user-facing buffer. logger.warn only.
@@ -449,15 +542,9 @@ function AudiobookshelfApi:downloadCover(id, local_path)
         socketutil:reset_timeout()
         return false
     end
-    local request = {
-        url = server .. "/api/items/" .. id .. "/cover?format=webp",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. token,
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.file(outfile),
-    }
+    local request = buildRequest(server, token,
+        "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
+        ltn12.sink.file(outfile))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
     if not ok or code ~= 200 then
@@ -472,6 +559,10 @@ function AudiobookshelfApi:downloadCover(id, local_path)
 end
 
 function AudiobookshelfApi:getSearchResults(id, search_query)
+    local server, token = credentials()
+    if not server then
+        return unconfigured("getSearchResults")
+    end
     local sink = {}
     local url_encoded_search_string = util.urlEncode(search_query)
     -- The `filter` parameter that used to sit here is dead: the search
@@ -480,15 +571,9 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
     -- plugin was paying for a parameter that did nothing. The ebook test is
     -- applied client-side against the frame-cached snapshot instead
     -- (D-15/SRCH-07).
-    local request = {
-        url = Settings:read("server") .. "/api/libraries/" .. id .. "/search?q=" .. url_encoded_search_string .. "&limit=" .. SEARCH_GROUP_LIMIT,
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. Settings:read("token"),
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
+    local request = buildRequest(server, token,
+        "/api/libraries/" .. util.urlEncode(id) .. "/search?q=" .. url_encoded_search_string .. "&limit=" .. SEARCH_GROUP_LIMIT,
+        ltn12.sink.table(sink))
     -- This is a raised-limit search response on possibly-weak Wi-Fi -- use
     -- the large-content timeouts rather than the argument-less 5s/15s
     -- default.
@@ -500,6 +585,9 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
         logger.warn("AudiobookshelfApi: http request failed in getSearchResults:", code)
         ErrorLog:record(T("getSearchResults: connection failed: %1", tostring(code)))
         return nil, "connection"
+    end
+    if isRedirect(code) then
+        return redirected("getSearchResults", code, status)
     end
     if code == 200 and response ~= "" then
         -- D-13's derived rule: a search response is malformed only when the
@@ -546,15 +634,7 @@ function AudiobookshelfApi:testConnection()
         return false, message
     end
     local sink = {}
-    local request = {
-        url = server .. "/api/me",
-        method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. token,
-            ["User-Agent"] = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, ".")),
-        },
-        sink = ltn12.sink.table(sink),
-    }
+    local request = buildRequest(server, token, "/api/me", ltn12.sink.table(sink))
     socketutil:set_timeout()
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
@@ -566,6 +646,14 @@ function AudiobookshelfApi:testConnection()
     end
     if code == 200 then
         return true, nil
+    end
+    if isRedirect(code) then
+        -- The one place a redirect gets a full sentence: this is the check a
+        -- user runs when something is wrong, so name the two usual causes.
+        local message = _("The server redirected the request instead of answering it. Check the URL (http vs https, extra path), or sign in to the Wi-Fi network first.")
+        logger.warn("AudiobookshelfApi: testConnection redirected:", status or code)
+        ErrorLog:record(message)
+        return false, message
     end
     if code == 401 then
         local message = _("Invalid or expired API token")

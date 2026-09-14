@@ -243,9 +243,30 @@ end
 -- unreadable response -- it is not a network problem. Every other reason
 -- keeps the caller's existing, context-specific wording.
 function AudiobookshelfBrowser:showApiFailure(reason, fallback_text)
+    if reason == "unconfigured" then
+        -- S1: a fresh install. Nothing about the network caused this, so do
+        -- not report it as a network failure -- open Settings. Deferred one
+        -- tick because the first call comes from init(), before this browser
+        -- is on screen; shown synchronously, Settings would land underneath
+        -- the browser that is about to be shown on top of it. Settings first,
+        -- then the message, so the message is what the user sees.
+        UIManager:nextTick(function()
+            UIManager:show(SettingsMenu:new{})
+            UIManager:show(InfoMessage:new{
+                text = _("Set your server URL and API token to get started."),
+                timeout = 3,
+            })
+        end)
+        return
+    end
     local text = fallback_text
     if reason == "unreadable" then
         text = _("Audiobookshelf sent a response this plugin could not read. See Recent errors in Settings.")
+    elseif reason == "redirect" then
+        -- S2: the request was refused rather than followed. The two usual
+        -- causes are a wrong URL scheme or path, and a captive-portal Wi-Fi
+        -- that answers every request with its sign-in page.
+        text = _("The server redirected the request. Check the server URL, or sign in to the Wi-Fi network first.")
     end
     UIManager:show(InfoMessage:new{
         text = text,
