@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.4
+
+Security hardening following a full audit.
+
+- A fresh install no longer crashes KOReader on the first tap. With no server
+  or token configured, the browser now opens Settings and says what to fill in.
+- HTTP redirects are refused instead of followed, so the API token can no
+  longer be handed to a captive-portal Wi-Fi sign-in page or any other host.
+- The token entry field is masked and no longer pre-filled with the stored
+  value; an empty save keeps the existing token.
+- Saving an `http://` server address warns once that the token travels
+  unencrypted.
+- Server-issued ids are percent-encoded before use in request paths.
+- Library and series listings are fetched in pages of 100 instead of one
+  request for the whole library.
+- Fixed a crash when drawing a page of covers that were not yet cached.
+
 ## 0.1.0
 
 First release under the Audiobookshelf Bridge name.
