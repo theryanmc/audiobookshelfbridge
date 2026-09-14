@@ -25,7 +25,41 @@ jobs:
           release_branches: main
 
       - name: Zip release
-        run: cd .. && zip -r audiobookshelfbridge.koplugin.zip audiobookshelfbridge -x '*.git*' 'audiobookshelfbridge/spec/*' 'audiobookshelfbridge/lua_modules/*' 'audiobookshelfbridge/.luarocks/*' 'audiobookshelfbridge/lua' 'audiobookshelfbridge/luarocks' 'audiobookshelfbridge/.tool-versions' '*.rockspec' && cd audiobookshelfbridge && mv ../audiobookshelfbridge.koplugin.zip .
+        # KOReader only loads plugin directories whose name ends in .koplugin
+        # (pluginloader.lua: entry:sub(-9) == ".koplugin"). Zipping the checkout
+        # directly packaged it under the repository name, so the archive
+        # unpacked to a folder KOReader silently ignored. Stage the files under
+        # the required name first, then zip that.
+        run: |
+          mkdir -p dist/audiobookshelfbridge.koplugin
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='dist/' \
+            --exclude='.planning/' \
+            --exclude='.gsd/' \
+            --exclude='spec/' \
+            --exclude='lua_modules/' \
+            --exclude='.luarocks/' \
+            --exclude='.tool-versions' \
+            --exclude='*.rockspec' \
+            --exclude='*.zip' \
+            --exclude='.gitignore' \
+            --exclude='*.old' \
+            --exclude='audiobookshelf_config.lua' \
+            --exclude='audiobookshelfbridge_config.lua' \
+            ./ dist/audiobookshelfbridge.koplugin/
+          cd dist && zip -r ../audiobookshelfbridge.koplugin.zip audiobookshelfbridge.koplugin
+          cd ..
+          # rsync does not honour .gitignore, so a local run of this recipe
+          # would otherwise sweep a real audiobookshelfbridge_config.lua -- and
+          # the server URL and API token in it -- into a public archive. CI
+          # checks out a clean tree, but fail loudly rather than depend on that.
+          if unzip -l audiobookshelfbridge.koplugin.zip | grep -qE '(^|/)audiobookshelf(bridge)?_config\.lua$'; then
+            echo "::error::Real config file found in release archive - refusing to publish"
+            exit 1
+          fi
+          unzip -l audiobookshelfbridge.koplugin.zip
 
       - name: Release
         uses: softprops/action-gh-release@v2
