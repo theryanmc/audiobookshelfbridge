@@ -65,6 +65,12 @@ function SettingsMenu:genItemTable()
         type = "libraries",
     })
 
+    local grid_view = Settings:read("book_view", "grid") ~= "list"
+    table.insert(item_table, {
+        text = T(_("Book view: %1"), grid_view and _("cover tiles") or _("list")),
+        type = "book_view",
+    })
+
     table.insert(item_table, {
         text = _("Test connection"),
         type = "test",
@@ -96,6 +102,8 @@ function SettingsMenu:onMenuSelect(item)
         self:chooseDownloadFolder()
     elseif item.type == "libraries" then
         self:showLibraryVisibility()
+    elseif item.type == "book_view" then
+        self:toggleBookView()
     elseif item.type == "test" then
         self:runConnectionTest()
     elseif item.type == "errors" then
@@ -105,6 +113,14 @@ function SettingsMenu:onMenuSelect(item)
         -- (SET-13/empty).
     end
     return true
+end
+
+-- Two states, so the row toggles in place rather than opening a submenu for a
+-- binary choice. Takes effect on the next level the browser draws.
+function SettingsMenu:toggleBookView()
+    local grid_view = Settings:read("book_view", "grid") ~= "list"
+    Settings:write("book_view", grid_view and "list" or "grid")
+    self:refresh()
 end
 
 function SettingsMenu:editServer()

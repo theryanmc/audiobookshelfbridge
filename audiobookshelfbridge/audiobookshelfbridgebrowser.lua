@@ -1,6 +1,8 @@
 local AudiobookshelfApi = require("audiobookshelfbridge/audiobookshelfbridgeapi")
 local BookDetailsWidget = require("audiobookshelfbridge/audiobookshelfbridgebookdetailswidget")
+local CoverGrid = require("audiobookshelfbridge/audiobookshelfbridgecovergrid")
 local InfoMessage = require("ui/widget/infomessage")
+local logger = require("logger")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
 local NetworkMgr = require("ui/network/manager")
@@ -119,6 +121,67 @@ function AudiobookshelfBrowser:onSearchButtonTap()
     -- No wake here: this only opens the input dialog and makes no request.
     -- The request happens later, in search() (D-14).
     self:ShowSearch()
+end
+
+-- Cover tiles apply to a level whose rows are all books. The library, series
+-- and author levels build exactly that; the top level lists libraries and a
+-- search result can mix in authors and series, and those stay as text rows
+-- because there is no cover to show for them.
+--
+-- An empty table is not a book list, so it keeps the list renderer and its
+-- empty state.
+function AudiobookshelfBrowser:levelShowsBooks()
+    if not self.item_table or #self.item_table == 0 then
+        return false
+    end
+    for _, row in ipairs(self.item_table) do
+        if row.type ~= "book" then
+            return false
+        end
+    end
+    return true
+end
+
+function AudiobookshelfBrowser:gridEnabled()
+    -- Defaults to grid: the point of the view is to be the normal way to
+    -- browse. "list" in settings opts back out.
+    return Settings:read("book_view", "grid") ~= "list" and self:levelShowsBooks()
+end
+
+-- Menu derives perpage, available_height, item_dimen and page_num from
+-- items_per_page, so the grid announces its own page size through that field
+-- and lets Menu do the arithmetic. Tile geometry is then read back off the
+-- dimensions Menu just computed.
+function AudiobookshelfBrowser:_recalculateDimen(no_recalculate_dimen)
+    if self:gridEnabled() then
+        local width = (self.inner_dimen and self.inner_dimen.w) or self.screen_w
+        local height = (self.inner_dimen and self.inner_dimen.h) or self.screen_h
+        local cols, rows = CoverGrid.shapeFor(width, height)
+        self.grid_cols, self.grid_rows = cols, rows
+        self.items_per_page = cols * rows
+    else
+        self.grid_cols, self.grid_rows = nil, nil
+        self.items_per_page = nil
+    end
+    Menu._recalculateDimen(self, no_recalculate_dimen)
+end
+
+-- Grid rendering is opt-outable and, more importantly, fallible: it reaches
+-- into Menu internals that differ across KOReader builds. If it raises, fall
+-- through to the stock list renderer, which clears and rebuilds the same
+-- groups from scratch -- a half-built grid cannot leave the menu wedged.
+function AudiobookshelfBrowser:updateItems(select_number, no_recalculate_dimen)
+    if self:gridEnabled() then
+        local ok, err = pcall(CoverGrid.updateItems, self, select_number, no_recalculate_dimen)
+        if ok then
+            return
+        end
+        logger.warn("AudiobookshelfBrowser: cover grid failed, falling back to list:", err)
+        self.grid_cols, self.grid_rows = nil, nil
+        self.items_per_page = nil
+        no_recalculate_dimen = false
+    end
+    return Menu.updateItems(self, select_number, no_recalculate_dimen)
 end
 
 -- Single push site for the D-09 navigation frame contract: stashes level
