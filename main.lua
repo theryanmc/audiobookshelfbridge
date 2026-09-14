@@ -1,6 +1,5 @@
 local Dispatcher = require("dispatcher")
 local AudiobookshelfBrowser = require("audiobookshelfbridge/audiobookshelfbridgebrowser")
-local SettingsMenu = require("audiobookshelfbridge/audiobookshelfbridgesettingsmenu")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -63,27 +62,19 @@ end
 
 function Audiobookshelf:addToMainMenu(menu_items)
     injectIntoToolsMenu()
+    -- Opens the browser directly rather than a submenu: settings and search
+    -- are reachable from the browser's own title bar, so a two-row menu in
+    -- front of it was a step with nothing on it.
     menu_items[MENU_ID] = {
         text = _("Audiobookshelf Bridge"),
         -- fallback only: used if the order tables could not be required
         sorting_hint = "tools",
-        sub_item_table = {
-            {
-                text = _("Browse library"),
-                callback = function()
-                    local connect_callback = function()
-                        UIManager:show(AudiobookshelfBrowser:new())
-                    end
-                    NetworkMgr:runWhenOnline(connect_callback)
-                end
-            },
-            {
-                text = _("Settings"),
-                callback = function()
-                    UIManager:show(SettingsMenu:new{})
-                end
-            },
-        }
+        callback = function()
+            local connect_callback = function()
+                UIManager:show(AudiobookshelfBrowser:new())
+            end
+            NetworkMgr:runWhenOnline(connect_callback)
+        end,
     }
 end
 
