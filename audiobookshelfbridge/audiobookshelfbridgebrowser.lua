@@ -123,29 +123,32 @@ function AudiobookshelfBrowser:onSearchButtonTap()
     self:ShowSearch()
 end
 
--- Cover tiles apply to a level whose rows are all books. The library, series
--- and author levels build exactly that; the top level lists libraries and a
--- search result can mix in authors and series, and those stay as text rows
--- because there is no cover to show for them.
+-- Cover tiles apply to any level that contains at least one book.
 --
--- An empty table is not a book list, so it keeps the list renderer and its
--- empty state.
-function AudiobookshelfBrowser:levelShowsBooks()
+-- This deliberately does not require every row to be a book. Search results
+-- mix authors and series in with books, and requiring a uniform table dropped
+-- the whole results level back to text rows -- the one place a cover is most
+-- useful for telling near-identical titles apart. Author and series rows have
+-- no cover, so they render as labelled text tiles and never trigger a fetch.
+--
+-- The top level lists libraries and contains no books at all, so it keeps the
+-- list renderer; so does an empty table, which keeps its empty state.
+function AudiobookshelfBrowser:levelHasBooks()
     if not self.item_table or #self.item_table == 0 then
         return false
     end
     for _, row in ipairs(self.item_table) do
-        if row.type ~= "book" then
-            return false
+        if row.type == "book" then
+            return true
         end
     end
-    return true
+    return false
 end
 
 function AudiobookshelfBrowser:gridEnabled()
     -- Defaults to grid: the point of the view is to be the normal way to
     -- browse. "list" in settings opts back out.
-    return Settings:read("book_view", "grid") ~= "list" and self:levelShowsBooks()
+    return Settings:read("book_view", "grid") ~= "list" and self:levelHasBooks()
 end
 
 -- Menu derives perpage, available_height, item_dimen and page_num from
@@ -513,9 +516,11 @@ function AudiobookshelfBrowser:loadLibrarySearch(search)
     end
 
     -- D-04: a search pushes the results level if any group has at least
-    -- one surviving row -- generalizes cleanly to three groups. Only the
-    -- pinned search row present means every group matched nothing.
-    if #tbl == 1 then
+    -- one surviving row -- generalizes cleanly to three groups. An empty
+    -- table means every group matched nothing. (This counted 1, not 0,
+    -- while a pinned search row always occupied the first slot; moving
+    -- search to the title bar removed that row.)
+    if #tbl == 0 then
         UIManager:show(InfoMessage:new{
             text = T(_("No results for: %1"), search),
             timeout = 2,
