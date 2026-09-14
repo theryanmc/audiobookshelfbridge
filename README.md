@@ -112,6 +112,30 @@ books.
 - **Wi-Fi failures are expected.** When something fails, check
   **Settings → Recent errors** for what the server actually said.
 
+## Security notes
+
+Things worth knowing before you point this at a server you care about.
+
+- **Your API token is stored in plain text** in `audiobookshelfbridge_config.lua`
+  inside the plugin folder, with ordinary file permissions. On a single-user
+  e-reader that is fine. On a shared computer, anyone with access to your
+  files can read it.
+- **Use `https://`.** Over `http://` the token is sent unencrypted on every
+  request. The plugin warns once when you save an `http://` address.
+- **KOReader does not verify TLS certificates.** Its bundled HTTPS library
+  ships with verification turned off, and this plugin inherits that. `https://`
+  still protects you from passive eavesdropping, but not from an attacker who
+  can sit between the device and your server. This is a KOReader platform
+  limitation; the plugin cannot fix it on its own.
+- **Redirects are refused.** The plugin never follows an HTTP redirect, so a
+  captive-portal Wi-Fi network that redirects every request to its sign-in
+  page cannot be handed your token. If you see "the server redirected the
+  request", sign in to the network first or check the URL.
+- **Tokens never appear in logs or on screen.** The settings screen shows
+  `configured`, never the value; the token entry field is masked; and the
+  Recent errors list is built to never contain a token, header, or response
+  body.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
