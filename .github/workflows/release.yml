@@ -1,0 +1,36 @@
+name: Releases
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version and push tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+          release_branches: main
+
+      - name: Zip release
+        run: cd .. && zip -r audiobookshelfbridge.koplugin.zip audiobookshelfbridge -x '*.git*' 'audiobookshelfbridge/spec/*' 'audiobookshelfbridge/lua_modules/*' 'audiobookshelfbridge/.luarocks/*' 'audiobookshelfbridge/lua' 'audiobookshelfbridge/luarocks' 'audiobookshelfbridge/.tool-versions' '*.rockspec' && cd audiobookshelfbridge && mv ../audiobookshelfbridge.koplugin.zip .
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
+          files: audiobookshelfbridge.koplugin.zip

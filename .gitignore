@@ -1,0 +1,10 @@
+.planning/
+.gsd/
+
+# Local plugin config -- contains the server URL and API token
+audiobookshelf_config.lua
+audiobookshelfbridge_config.lua
+*.old
+
+# Build artifacts
+*.koplugin.zip
