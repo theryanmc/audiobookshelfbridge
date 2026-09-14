@@ -74,6 +74,51 @@ function AudiobookshelfBrowser:init()
         self.item_table = self:genItemTableFromLibraries()
     end
     Menu.init(self)
+    self:installSearchButton()
+end
+
+-- Search used to be a pinned first row in every library-scoped list. It is a
+-- title-bar icon now, which keeps it in one fixed place instead of costing a
+-- row on every page.
+--
+-- Menu hands TitleBar a left_icon but never a right_icon, and because it also
+-- hands over a close_callback, TitleBar claims the right slot for the close X
+-- (titlebar.lua:88-89). There are two slots and three things that want one, so
+-- search takes the right slot and closing falls back to the Back key/gesture,
+-- which Menu already handles.
+--
+-- setRightIcon only swaps the glyph, and IconButton captured the close
+-- callback by value at init -- but onTapIconButton calls self.callback()
+-- dynamically (iconbutton.lua:101-104), so reassigning the field rebinds the
+-- action. Both title-bar buttons are in TitleBar:generateHorizontalLayout(),
+-- so this stays reachable by D-pad on non-touch devices.
+function AudiobookshelfBrowser:installSearchButton()
+    local title_bar = self.title_bar
+    if not (title_bar and title_bar.right_button) then
+        -- No right slot on this build: leave the title bar alone rather than
+        -- lose the only way out of the browser.
+        return
+    end
+    title_bar:setRightIcon("appbar.search")
+    title_bar.right_button.callback = function()
+        self:onSearchButtonTap()
+    end
+end
+
+function AudiobookshelfBrowser:onSearchButtonTap()
+    -- Search is library-scoped (loadLibrarySearch runs against self.library_id).
+    -- At the top level there is no library to scope to, so say so rather than
+    -- opening a dialog whose result would have nowhere to go.
+    if not self.library_id then
+        UIManager:show(InfoMessage:new{
+            text = _("Open a library first to search it."),
+            timeout = 2,
+        })
+        return
+    end
+    -- No wake here: this only opens the input dialog and makes no request.
+    -- The request happens later, in search() (D-14).
+    self:ShowSearch()
 end
 
 -- Single push site for the D-09 navigation frame contract: stashes level
@@ -175,12 +220,6 @@ function AudiobookshelfBrowser:onMenuSelect(item)
             UIManager:show(bookdetailswidget, "flashui")
         end
         NetworkMgr:runWhenOnline(connect_callback)
-    elseif item.type == "search" then
-        -- No wake here: this only opens the input dialog and makes no
-        -- request. The request happens later, in search(), once there is
-        -- a term (D-14 rejects wrapping the whole dispatcher for exactly
-        -- this reason).
-        self:ShowSearch()
     elseif item.type == "series" then
         -- Capture into locals before the closure (REL-05): a deferred
         -- callback then builds the level for the library and series it was
@@ -269,17 +308,6 @@ function AudiobookshelfBrowser:onLeftButtonTap()
     UIManager:show(SettingsMenu:new{})
 end
 
--- The pinned first row of a library-scoped list (D-12/D-13). Defined as its
--- own method, not inlined inside a loop body, so its _() call resolves
--- against the module-level gettext import rather than a throwaway loop
--- variable that shadows it elsewhere in this file.
-function AudiobookshelfBrowser:genSearchRow()
-    return {
-        text = _("Search this library…"),
-        type = "search",
-    }
-end
-
 function AudiobookshelfBrowser:ShowSearch()
     self.search_dialog = InputDialog:new{
         title = _("Search"),
@@ -363,7 +391,6 @@ function AudiobookshelfBrowser:loadLibrarySearch(search)
         self:showApiFailure(reason, _("Search failed. Check network and settings."))
         return
     end
-    table.insert(tbl, self:genSearchRow())
 
     -- Hoisted above every loop below: each loop header binds the
     -- single-underscore identifier as its throwaway key variable, so a
@@ -453,7 +480,6 @@ function AudiobookshelfBrowser:openLibrary(id, name)
     end
     self.ebook_ids = ebook_ids
 
-    table.insert(tbl, self:genSearchRow())
     for _, item in ipairs(libraryItems) do
         table.insert(tbl, {
             id = item.id,
@@ -551,7 +577,6 @@ function AudiobookshelfBrowser:openSeries(series_id, series_name, library_id)
     table.sort(rows, compareSeriesRows)
 
     local tbl = {}
-    table.insert(tbl, self:genSearchRow())
     for _, row in ipairs(rows) do
         table.insert(tbl, row)
     end
@@ -623,7 +648,6 @@ function AudiobookshelfBrowser:openAuthor(author_id, author_name, library_id)
     table.sort(rows, compareByTitle)
 
     local tbl = {}
-    table.insert(tbl, self:genSearchRow())
     for _, row in ipairs(rows) do
         table.insert(tbl, row)
     end
