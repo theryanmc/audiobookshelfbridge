@@ -153,10 +153,21 @@ function SettingsMenu:editServer()
                         dialog:onClose()
                         UIManager:close(dialog)
                         self:refresh()
-                        UIManager:show(InfoMessage:new{
-                            text = _("Settings saved"),
-                            timeout = 1,
-                        })
+                        if trimmed:match("^http://") then
+                            -- S4: plaintext HTTP puts the API token on the
+                            -- wire in the clear on every request. Say so at
+                            -- the moment it is chosen, once, rather than
+                            -- accepting it silently.
+                            UIManager:show(InfoMessage:new{
+                                text = _("Saved. This address uses http://, so your API token is sent unencrypted on every request. Use https:// if your server supports it."),
+                                timeout = 6,
+                            })
+                        else
+                            UIManager:show(InfoMessage:new{
+                                text = _("Settings saved"),
+                                timeout = 1,
+                            })
+                        end
                     end,
                 },
             },
@@ -168,9 +179,18 @@ end
 
 function SettingsMenu:editToken()
     local dialog
+    local has_token = Settings:read("token", "") ~= ""
     dialog = InputDialog:new{
         title = _("API token"),
-        input = Settings:read("token", ""),
+        -- S3: never pre-fill the stored token. The settings row already says
+        -- "configured" without showing the value; loading the whole token
+        -- into a visible field undid that for anyone looking at the screen.
+        -- Empty on open, masked while typing, and an empty save keeps what
+        -- is already stored rather than wiping it.
+        input = "",
+        input_hint = has_token and _("Leave empty to keep the current token")
+            or _("Paste your API token"),
+        text_type = "password",
         buttons = {
             {
                 {
@@ -185,9 +205,17 @@ function SettingsMenu:editToken()
                     text = _("Save"),
                     callback = function()
                         local value = dialog:getInputText()
-                        Settings:write("token", value)
+                        local trimmed = value:match("^%s*(.-)%s*$") or ""
                         dialog:onClose()
                         UIManager:close(dialog)
+                        if trimmed == "" then
+                            UIManager:show(InfoMessage:new{
+                                text = has_token and _("Token unchanged") or _("No token entered"),
+                                timeout = 1,
+                            })
+                            return
+                        end
+                        Settings:write("token", trimmed)
                         self:refresh()
                         UIManager:show(InfoMessage:new{
                             text = _("Settings saved"),
