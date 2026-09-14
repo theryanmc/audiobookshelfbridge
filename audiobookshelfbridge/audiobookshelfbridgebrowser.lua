@@ -1,5 +1,6 @@
 local AudiobookshelfApi = require("audiobookshelfbridge/audiobookshelfbridgeapi")
 local BookDetailsWidget = require("audiobookshelfbridge/audiobookshelfbridgebookdetailswidget")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CoverGrid = require("audiobookshelfbridge/audiobookshelfbridgecovergrid")
 local InfoMessage = require("ui/widget/infomessage")
 local logger = require("logger")
@@ -59,7 +60,7 @@ local AudiobookshelfBrowser = Menu:extend{
     title = _("Audiobookshelf Browser"),
     is_popout = false,
     is_borderless = true,
-    title_bar_left_icon = "appbar.settings",
+    title_bar_left_icon = "appbar.menu",
     show_parent = nil
 }
 
@@ -76,51 +77,48 @@ function AudiobookshelfBrowser:init()
         self.item_table = self:genItemTableFromLibraries()
     end
     Menu.init(self)
-    self:installSearchButton()
 end
 
--- Search used to be a pinned first row in every library-scoped list. It is a
--- title-bar icon now, which keeps it in one fixed place instead of costing a
--- row on every page.
+-- The title bar has exactly two icon slots, and the right one is spoken for:
+-- Menu wires it to close_callback -> onClose, which under D-01 means "up one
+-- level, or tear down at the root". It is the back button AND the way out, so
+-- it cannot be repurposed -- doing so removed both at once.
 --
--- Menu hands TitleBar a left_icon but never a right_icon, and because it also
--- hands over a close_callback, TitleBar claims the right slot for the close X
--- (titlebar.lua:88-89). There are two slots and three things that want one, so
--- search takes the right slot and closing falls back to the Back key/gesture,
--- which Menu already handles.
---
--- setRightIcon only swaps the glyph, and IconButton captured the close
--- callback by value at init -- but onTapIconButton calls self.callback()
--- dynamically (iconbutton.lua:101-104), so reassigning the field rebinds the
--- action. Both title-bar buttons are in TitleBar:generateHorizontalLayout(),
--- so this stays reachable by D-pad on non-touch devices.
-function AudiobookshelfBrowser:installSearchButton()
-    local title_bar = self.title_bar
-    if not (title_bar and title_bar.right_button) then
-        -- No right slot on this build: leave the title bar alone rather than
-        -- lose the only way out of the browser.
-        return
-    end
-    title_bar:setRightIcon("appbar.search")
-    title_bar.right_button.callback = function()
-        self:onSearchButtonTap()
-    end
-end
+-- That leaves one slot for both settings and search. A menu behind it is how
+-- KOReader's own OPDS browser resolves the same squeeze (opdsbrowser.lua:90 --
+-- appbar.menu opening a ButtonDialog that holds Search), so this follows that
+-- precedent rather than inventing a third convention.
+function AudiobookshelfBrowser:onLeftButtonTap()
+    local dialog
+    local buttons = {}
 
-function AudiobookshelfBrowser:onSearchButtonTap()
-    -- Search is library-scoped (loadLibrarySearch runs against self.library_id).
-    -- At the top level there is no library to scope to, so say so rather than
-    -- opening a dialog whose result would have nowhere to go.
-    if not self.library_id then
-        UIManager:show(InfoMessage:new{
-            text = _("Open a library first to search it."),
-            timeout = 2,
-        })
-        return
+    -- Search is library-scoped: loadLibrarySearch runs against self.library_id.
+    -- At the top level there is no library to scope to, so the row is simply
+    -- absent rather than present-and-failing.
+    if self.library_id then
+        table.insert(buttons, {{
+            text = _("Search this library"),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                -- No wake here: this only opens the input dialog and makes no
+                -- request. The request happens later, in search() (D-14).
+                self:ShowSearch()
+            end,
+        }})
     end
-    -- No wake here: this only opens the input dialog and makes no request.
-    -- The request happens later, in search() (D-14).
-    self:ShowSearch()
+
+    table.insert(buttons, {{
+        text = _("Settings"),
+        align = "left",
+        callback = function()
+            UIManager:close(dialog)
+            UIManager:show(SettingsMenu:new{})
+        end,
+    }})
+
+    dialog = ButtonDialog:new{ buttons = buttons }
+    UIManager:show(dialog)
 end
 
 -- Cover tiles apply to any level that contains at least one book.
@@ -368,10 +366,6 @@ function AudiobookshelfBrowser:onMultiSwipe(arg, ges_ev)
         self:onCloseAllMenus()
     end
     return true
-end
-
-function AudiobookshelfBrowser:onLeftButtonTap()
-    UIManager:show(SettingsMenu:new{})
 end
 
 function AudiobookshelfBrowser:ShowSearch()
