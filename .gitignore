@@ -1,5 +1,9 @@
-.planning/
+# Local tooling -- workflow state, not plugin source
+AGENTS.md
+.mcp.json
 .gsd/
+gsd-core/
+.planning/
 
 # Local plugin config -- contains the server URL and API token
 audiobookshelf_config.lua
