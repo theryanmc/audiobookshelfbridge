@@ -237,11 +237,18 @@ end
 -- counter and FocusManager keep working exactly as they do for the list.
 function CoverGrid.updateItems(menu, select_number, no_recalculate_dimen)
     local old_dimen = menu.dimen and menu.dimen:copy()
-    menu.layout = {}
-    menu.item_group:clear()
-    menu.page_info:resetLayout()
-    menu.return_button:resetLayout()
-    menu.content_group:resetLayout()
+
+    -- Work out the page shape and put the loading notice up BEFORE touching the
+    -- widget tree.
+    --
+    -- showLoading calls UIManager:forceRePaint, which paints every widget on
+    -- the stack -- this menu included. Doing that between item_group:clear()
+    -- and the inserts below painted an item_group that was empty at the time:
+    -- VerticalGroup:getSize fills _offsets only while _size is nil, so sizing
+    -- the empty group cached _size={0,0} and _offsets={}, and the rows added
+    -- afterwards never got offsets. The next paint then indexed a nil offset
+    -- and took KOReader down (verticalgroup.lua:48). Painting here instead
+    -- shows the previous page, which is a complete and consistent tree.
     menu:_recalculateDimen(no_recalculate_dimen)
 
     local cols = menu.grid_cols or 2
@@ -256,6 +263,12 @@ function CoverGrid.updateItems(menu, select_number, no_recalculate_dimen)
     -- a cached page draws immediately and a flashed message would be noise.
     local pending = CoverGrid.countUncached(menu, idx_offset, perpage)
     local notice = CoverGrid.showLoading(pending)
+
+    menu.layout = {}
+    menu.item_group:clear()
+    menu.page_info:resetLayout()
+    menu.return_button:resetLayout()
+    menu.content_group:resetLayout()
 
     for row = 1, rows do
         local row_group = HorizontalGroup:new{}
@@ -287,6 +300,12 @@ function CoverGrid.updateItems(menu, select_number, no_recalculate_dimen)
             table.insert(menu.layout, row_layout)
         end
     end
+
+    -- Belt and braces for the crash described above: whatever happened while
+    -- the tiles were being built (a fetch, a repaint, a dialog), the group's
+    -- cached geometry is discarded here so the next getSize rebuilds _offsets
+    -- against the children that are actually present.
+    menu.item_group:resetLayout()
 
     CoverGrid.hideLoading(notice)
 
