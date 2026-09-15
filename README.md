@@ -93,12 +93,34 @@ publish or share.
 Pick a library, and its books appear as cover tiles. Tap one for its details,
 then choose a file to download.
 
+### Browse books, series, and authors
+
 Use **Books | Series | Authors** below the header to browse the library.
-Series and Authors list groups with ebooks in this library, with ebook counts
-on the right. Tap a group to open its books; X returns to the originating tab.
+The filled dot marks the active tab.
+
+- **Books** shows ebook covers and titles. Switch to a text list with
+  **Settings → Book view** if you prefer.
+- **Series** lists series with ebooks in this library, with ebook counts on
+  the right. Tap a series to open its books.
+- **Authors** lists authors with ebooks in this library, also with ebook counts
+  on the right. Tap an author to see their books, as shown for Lewis Carroll
+  below.
+
+When you open a series or author, the location below the header identifies the
+group you are viewing. Tap **✕** to return to the originating tab.
 Each tab remembers its page while the library is open. The first visit to Series
 or Authors loads their metadata in batches; subsequent tab switches use the
 cached results until you reopen the library.
+
+| Books: cover tiles | Series: names and ebook counts |
+|:------------------:|:-----------------------------:|
+| <img src="docs/screenshots/books.png" alt="Books tab showing ebook cover tiles and titles on page 37 of 37" width="360"> | <img src="docs/screenshots/series.png" alt="Series tab showing series names and ebook counts on page 3 of 4" width="360"> |
+
+| Authors: names and ebook counts | Books by a selected author |
+|:------------------------------:|:--------------------------:|
+| <img src="docs/screenshots/authors.png" alt="Authors tab showing author names and ebook counts on page 6 of 8" width="360"> | <img src="docs/screenshots/author-books.png" alt="Author: Lewis Carroll view showing the cover of Alice's Adventures in Wonderland" width="360"> |
+
+### Navigation and search
 
 If only one library is enabled, the browser opens it directly. The X button
 then closes the plugin from that library's book list.
@@ -108,7 +130,12 @@ then closes the plugin from that library's book list.
 | **Search** (magnifying glass, top right) | Search this library |
 | **Settings** (gear, top right) | Open Settings |
 | **✕** (top right) | Back one level; closes the plugin at the top level |
+| **‹ / ›** (single arrows, bottom) | Previous / next page |
+| **« / »** (double arrows, bottom) | First / last page |
 | Multi-swipe | Closes the browser from any depth |
+
+The page indicator shows your position in the current list. Arrows are grayed
+out when there is no page to move to in that direction.
 
 The header keeps the plugin name on the left, with the current location below it.
 Search is scoped to the library you are in and only appears once you have opened
