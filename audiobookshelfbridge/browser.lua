@@ -1,6 +1,7 @@
 local AudiobookshelfApi = require("audiobookshelfbridge/api")
 local BookDetailsWidget = require("audiobookshelfbridge/bookdetailswidget")
 local BrowserTitleBar = require("audiobookshelfbridge/titlebar")
+local LibraryTabs = require("audiobookshelfbridge/librarytabs")
 local CoverGrid = require("audiobookshelfbridge/covergrid")
 local InfoMessage = require("ui/widget/infomessage")
 local logger = require("logger")
@@ -172,11 +173,32 @@ function AudiobookshelfBrowser:pushLevel(new_level, new_title, new_item_table, n
     self.item_table.itemnumber = self.last_selected_index
     self.item_table.page = self.page
     self.item_table.ebook_ids = self.ebook_ids
+    self.item_table.library_tab = self.library_tab
     table.insert(self.item_table_stack, self.item_table)
     self.level = new_level
     self.library_id = new_library_id
     self.current_title = new_title
     self:switchItemTable(new_title, new_item_table)
+end
+
+function AudiobookshelfBrowser:switchLibraryTab(tab)
+    if self.level ~= "library" or not self.library_tabs or not self.library_tabs[tab]
+        or tab == self.library_tab then
+        return false
+    end
+    self.item_table.page = self.page
+    self.item_table.itemnumber = self.itemnumber
+    self.library_tab = tab
+    self.item_table = self.library_tabs[tab]
+    self.page = self.item_table.page or 1
+    self.itemnumber = self.item_table.itemnumber
+    self.last_selected_index = nil
+    self.search_index = nil
+    self.title_bar:setTitle(self.current_title, true)
+    -- Recalculate after changing rows: Books and text lists have different
+    -- page sizes. Converting indices with the outgoing perpage loses position.
+    self:updateItems(1, false)
+    return true
 end
 
 function AudiobookshelfBrowser:genItemTableFromLibraries()
@@ -323,6 +345,7 @@ function AudiobookshelfBrowser:onClose()
     self.library_id = frame.library_id
     self.current_title = frame.title
     self.ebook_ids = frame.ebook_ids
+    self.library_tab = frame.library_tab
 
     local restored = frame
     if frame.level == "abs" then
@@ -349,7 +372,14 @@ function AudiobookshelfBrowser:onClose()
     -- bare Menu:extend widget like this one never satisfies -- set it
     -- directly so the highlight restore bypasses that gate.
     self.itemnumber = restore_index
-    self:switchItemTable(frame.title, restored, restore_index)
+    if frame.level == "library" and frame.page then
+        -- The child may be a cover grid while the parent is a text tab.
+        -- Restore its page directly; the child's perpage cannot map this index.
+        self.page = frame.page
+        self:switchItemTable(frame.title, restored, -1)
+    else
+        self:switchItemTable(frame.title, restored, restore_index)
+    end
     return true
 end
 
@@ -523,7 +553,6 @@ function AudiobookshelfBrowser:loadLibrarySearch(search)
 end
 
 function AudiobookshelfBrowser:openLibrary(id, name)
-    local tbl = {}
     local libraryItems, reason = AudiobookshelfApi:getLibraryItems(id)
     if not libraryItems then
         self:showApiFailure(reason, _("Could not load library. Check network and settings."))
@@ -539,16 +568,9 @@ function AudiobookshelfBrowser:openLibrary(id, name)
     end
     self.ebook_ids = ebook_ids
 
-    for _, item in ipairs(libraryItems) do
-        table.insert(tbl, {
-            id = item.id,
-            text = item.media.metadata.title,
-            mandatory = item.media.metadata.authorName,
-            type = "book"
-        })
-    end
-
-    self:pushLevel("library", name, tbl, id)
+    self.library_tabs = LibraryTabs.build(libraryItems)
+    self.library_tab = "books"
+    self:pushLevel("library", name, self.library_tabs.books, id)
     return true
 end
 

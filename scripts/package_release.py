@@ -28,6 +28,7 @@ FILES = (
     "audiobookshelfbridge/settings.lua",
     "audiobookshelfbridge/settingsmenu.lua",
     "audiobookshelfbridge/titlebar.lua",
+    "audiobookshelfbridge/librarytabs.lua",
 )
 
 
