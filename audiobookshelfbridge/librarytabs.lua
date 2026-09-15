@@ -1,6 +1,16 @@
 -- Build indexes from the same ebook snapshot as Books, without extra requests.
 local LibraryTabs = {}
 
+function LibraryTabs.hasGroupMetadata(items)
+    for _, item in ipairs(items) do
+        local metadata = item.media and item.media.metadata or {}
+        if type(metadata.authors) ~= "table" or type(metadata.series) ~= "table" then
+            return false
+        end
+    end
+    return true
+end
+
 function LibraryTabs.build(items)
     local tabs = { books = {}, series = {}, authors = {} }
     local indexes = { series = {}, authors = {} }

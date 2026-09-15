@@ -344,6 +344,59 @@ function AudiobookshelfApi:getAuthorItems(author_id)
     return nil, "server"
 end
 
+-- The library listing always uses minified metadata on current ABS servers.
+-- Batch-get is a read-only POST returning the author/series ID arrays we need.
+function AudiobookshelfApi:getLibraryItemsMetadata(items)
+    local server, token = credentials()
+    if not server then return unconfigured("getLibraryItemsMetadata") end
+    local expanded = {}
+    for first = 1, #items, ITEMS_PAGE_SIZE do
+        local ids, expected = {}, {}
+        for i = first, math.min(first + ITEMS_PAGE_SIZE - 1, #items) do
+            ids[#ids + 1] = items[i].id
+            expected[items[i].id] = true
+        end
+        local body = JSON.encode({ libraryItemIds = ids })
+        local sink = {}
+        local request = buildRequest(server, token, "/api/items/batch/get", ltn12.sink.table(sink))
+        request.method = "POST"
+        request.headers["Content-Type"] = "application/json"
+        request.headers["Content-Length"] = tostring(#body)
+        request.source = ltn12.source.string(body)
+        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        local ok, code = pcall(function() return socket.skip(1, http.request(request)) end)
+        socketutil:reset_timeout()
+        if not ok then
+            ErrorLog:record("getLibraryItemsMetadata: connection failed")
+            return nil, "connection"
+        end
+        if isRedirect(code) then return redirected("getLibraryItemsMetadata", code) end
+        if code ~= 200 then
+            ErrorLog:record("getLibraryItemsMetadata: server error " .. tostring(code))
+            return nil, "server"
+        end
+        local result = self:decodeResponse(table.concat(sink), "getLibraryItemsMetadata", "libraryItems")
+        if not result then return nil, "unreadable" end
+        for _, item in ipairs(result) do
+            local metadata = type(item) == "table" and type(item.media) == "table" and item.media.metadata
+            if type(metadata) ~= "table" or not expected[item.id]
+                or type(metadata.authors) ~= "table" or type(metadata.series) ~= "table" then
+                ErrorLog:record("getLibraryItemsMetadata: invalid item metadata")
+                return nil, "unreadable"
+            end
+            expanded[item.id] = item
+            expected[item.id] = nil
+        end
+        if next(expected) then
+            ErrorLog:record("getLibraryItemsMetadata: incomplete response")
+            return nil, "unreadable"
+        end
+    end
+    local ordered = {}
+    for _, item in ipairs(items) do ordered[#ordered + 1] = expanded[item.id] end
+    return ordered
+end
+
 function AudiobookshelfApi:getLibraryItem(id)
     local server, token = credentials()
     if not server then

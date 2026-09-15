@@ -96,8 +96,9 @@ then choose a file to download.
 Use **Books | Series | Authors** below the header to browse the library.
 Series and Authors list groups with ebooks in this library, with ebook counts
 on the right. Tap a group to open its books; X returns to the originating tab.
-Each tab remembers its page while the library is open. Switching tabs uses the
-loaded library snapshot and makes no additional network requests.
+Each tab remembers its page while the library is open. The first visit to Series
+or Authors loads their metadata in batches; subsequent tab switches use the
+cached results until you reopen the library.
 
 If only one library is enabled, the browser opens it directly. The X button
 then closes the plugin from that library's book list.

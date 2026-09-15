@@ -47,6 +47,18 @@ end
 local TitleBar = require("audiobookshelfbridge/titlebar")
 local Api = {}
 function Api:getLibraryItems() return items end
+local metadata_calls = 0
+function Api:getLibraryItemsMetadata(source)
+    metadata_calls = metadata_calls + 1
+    local result = {}
+    for _, item in ipairs(source) do
+        local metadata = item.media.metadata
+        result[#result + 1] = book(item.id,
+            type(metadata.authors) == "table" and metadata.authors or {},
+            type(metadata.series) == "table" and metadata.series or {})
+    end
+    return result
+end
 package.loaded["audiobookshelfbridge/api"] = Api
 for _, name in ipairs({ "bookdetailswidget", "covergrid", "settings", "settingsmenu" }) do
     package.loaded["audiobookshelfbridge/" .. name] = {}
@@ -55,7 +67,7 @@ for _, name in ipairs({ "infomessage", "inputdialog" }) do
     package.loaded["ui/widget/" .. name] = Widget
 end
 package.loaded.logger = {}
-package.loaded["ui/network/manager"] = {}
+package.loaded["ui/network/manager"] = {runWhenOnline=function(_, callback) callback() end}
 package.loaded["ui/uimanager"] = {}
 package.loaded["ffi/util"] = { template=function(text) return text end }
 local Menu = Widget:extend{}
@@ -89,6 +101,13 @@ assert(not browser.title_bar.search_button.hidden)
 assert(#browser.title_bar:generateVerticalLayout() == 2)
 assert(browser.title_bar.tab_buttons.books.width == 200)
 assert(browser.title_bar.tab_buttons.books.text == "● Books")
+-- Initial list metadata may be condensed; load grouping data only on demand.
+assert(metadata_calls == 0)
+browser:switchLibraryTab("series")
+assert(metadata_calls == 1 and #browser.library_tabs.series == 2)
+browser:switchLibraryTab("authors")
+assert(metadata_calls == 1 and #browser.item_table == 3)
+browser:switchLibraryTab("books")
 -- Give both renderers multiple pages with different page sizes.
 for i=5,36 do browser.library_tabs.books[i] = {id=tostring(i), text=tostring(i), type="book"} end
 for i=3,24 do browser.library_tabs.series[i] = {id=tostring(i), text=tostring(i), type="series"} end
@@ -130,4 +149,30 @@ browser:switchLibraryTab("authors")
 assert(#browser.item_table_stack == 0)
 browser:onClose()
 assert(browser.closed)
+-- Reproduce the real list response: only display names, no ID arrays.
+local minified = {{id="minimal", media={metadata={title="Minimal", authorName="Alpha", seriesName="Series #1"}}}}
+assert(not LibraryTabs.hasGroupMetadata(minified))
+assert(LibraryTabs.hasGroupMetadata({}))
+browser.closed = nil
+function Api:getLibraryItems() return minified end
+function Api:getLibraryItemsMetadata() return nil, "connection" end
+browser:openLibrary("library-c", "C")
+browser:switchLibraryTab("series")
+assert(browser.library_tab == "books" and not browser.library_groups_loaded)
+function Api:getLibraryItemsMetadata()
+    return {book("minimal", {{id="a",name="Alpha"}}, {{id="s",name="Series"}})}
+end
+browser:switchLibraryTab("authors")
+assert(browser.library_groups_loaded and #browser.item_table == 1 and browser.item_table[1].id == "a")
+browser:switchLibraryTab("series")
+assert(#browser.item_table == 1 and browser.item_table[1].id == "s")
+-- A Wi-Fi callback queued for an old library must not change the current view.
+browser:openLibrary("library-c", "C")
+local deferred
+package.loaded["ui/network/manager"].runWhenOnline = function(_, cb) deferred = cb end
+browser:switchLibraryTab("authors")
+function Api:getLibraryItems() return {} end
+browser:openLibrary("library-d", "D")
+deferred()
+assert(browser.library_id == "library-d" and browser.library_tab == "books")
 print("PASS: grouping, tab state, header controls, back navigation, library isolation, and root exit")

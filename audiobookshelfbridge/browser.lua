@@ -186,6 +186,22 @@ function AudiobookshelfBrowser:switchLibraryTab(tab)
         or tab == self.library_tab then
         return false
     end
+    if tab ~= "books" and not self.library_groups_loaded then
+        local items, origin = self.library_items, self.item_table
+        NetworkMgr:runWhenOnline(function()
+            if self.level ~= "library" or self.library_items ~= items or self.item_table ~= origin then return end
+            local expanded, reason = AudiobookshelfApi:getLibraryItemsMetadata(items)
+            if not expanded then
+                self:showApiFailure(reason, _("Could not load authors and series. Check network and try again."))
+                return
+            end
+            local groups = LibraryTabs.build(expanded)
+            self.library_tabs.series, self.library_tabs.authors = groups.series, groups.authors
+            self.library_groups_loaded = true
+            self:switchLibraryTab(tab)
+        end)
+        return true
+    end
     self.item_table.page = self.page
     self.item_table.itemnumber = self.itemnumber
     self.library_tab = tab
@@ -569,6 +585,8 @@ function AudiobookshelfBrowser:openLibrary(id, name)
     self.ebook_ids = ebook_ids
 
     self.library_tabs = LibraryTabs.build(libraryItems)
+    self.library_items = libraryItems
+    self.library_groups_loaded = LibraryTabs.hasGroupMetadata(libraryItems)
     self.library_tab = "books"
     self:pushLevel("library", name, self.library_tabs.books, id)
     return true
