@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Added Books, Series, and Authors tabs to the library browser, with ebook
+  counts for authors and series.
+- Remember each tab's page and restore it when returning from a book list or
+  search results; switching tabs does not add back-navigation steps.
+- Load author and series metadata in batches on first use and cache it for
+  the library session, supporting Audiobookshelf's condensed listing responses.
+- Keep the current tab available for retrying when metadata loading fails.
+
 ## 0.2.0
 
 - Shortened runtime module filenames and updated all internal imports.
