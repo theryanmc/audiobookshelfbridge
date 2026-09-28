@@ -564,33 +564,34 @@ local ITEMS_MAX_PAGES = 200
 -- `base_path` is the encoded path plus its own query string, without limit or
 -- page. Stops when a page comes back short or the running total reaches the
 -- server's declared `total`. Same return contract as the single-request
--- methods: the results array, or nil plus a reason.
-local function fetchAllPages(self, server, token, base_path, method_name)
+-- methods: the results array, or nil plus a reason. AUTH-03: each page runs
+-- its own withAuth + sendTable, so credentials are re-read per page and a
+-- page requested after a mid-listing refresh carries the new token.
+local function fetchAllPages(self, base_path, method_name)
     local all = {}
     for page = 0, ITEMS_MAX_PAGES - 1 do
-        local sink = {}
-        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-        local request = buildRequest(server, token,
-            base_path .. "&limit=" .. ITEMS_PAGE_SIZE .. "&page=" .. page,
-            socketutil.table_sink(sink))
-        local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-        local response = table.concat(sink)
-        socketutil:reset_timeout()
-        if isConnectionFailure(ok, code) then
-            return connectionFailed(method_name, code)
+        local path = base_path .. "&limit=" .. ITEMS_PAGE_SIZE .. "&page=" .. page
+        local outcome, reason = withAuth(function(server, token)
+            return sendTable(server, token, path, socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        end)
+        if not outcome then
+            return authFailed(method_name, reason)
         end
-        if isRedirect(code) then
-            return redirected(method_name, code, status)
+        if isConnectionFailure(outcome.ok, outcome.code) then
+            return connectionFailed(method_name, outcome.code)
         end
-        if code ~= 200 or response == "" then
-            logger.warn("AudiobookshelfApi: " .. method_name .. " page", page, "failed:", status or code)
-            ErrorLog:record(T("%1: server error: %2", method_name, tostring(status or code)))
+        if isRedirect(outcome.code) then
+            return redirected(method_name, outcome.code, outcome.status)
+        end
+        if outcome.code ~= 200 or outcome.body == "" then
+            logger.warn("AudiobookshelfApi: " .. method_name .. " page", page, "failed:", outcome.status or outcome.code)
+            ErrorLog:record(T("%1: server error: %2", method_name, tostring(outcome.status or outcome.code)))
             return nil, "server"
         end
         -- Whole object, not just `results`: `total` is needed to know when to
         -- stop. The shape check on `results` mirrors decodeResponse's own
         -- missing-field branch so a malformed page is reported the same way.
-        local decoded = self:decodeResponse(response, method_name)
+        local decoded = self:decodeResponse(outcome.body, method_name)
         if not decoded then
             return nil, "unreadable"
         end
@@ -612,13 +613,9 @@ local function fetchAllPages(self, server, token, base_path, method_name)
 end
 
 function AudiobookshelfApi:getLibraryItems(id)
-    local server, token = credentials()
-    if not server then
-        return unconfigured("getLibraryItems")
-    end
     -- this is "ebooks" base64 encoded, and the URL encoded, to only return library items with ebooks
     local filters = "ebooks." .. "ZWJvb2s%3D"
-    return fetchAllPages(self, server, token,
+    return fetchAllPages(self,
         "/api/libraries/" .. util.urlEncode(id) .. "/items?filter=" .. filters .. "&sort=media.metadata.title",
         "getLibraryItems")
 end
@@ -639,12 +636,8 @@ end
 -- which is precisely why SRCH-07's ebook test is applied client-side against
 -- the frame-cached snapshot.
 function AudiobookshelfApi:getSeriesItems(library_id, series_id)
-    local server, token = credentials()
-    if not server then
-        return unconfigured("getSeriesItems")
-    end
     local filters = "series." .. util.urlEncode(sha2.bin_to_base64(series_id))
-    return fetchAllPages(self, server, token,
+    return fetchAllPages(self,
         "/api/libraries/" .. util.urlEncode(library_id) .. "/items?filter=" .. filters,
         "getSeriesItems")
 end
@@ -660,49 +653,43 @@ end
 -- which this plan does not consume but which is cheap and keeps the
 -- option open without another endpoint change.
 function AudiobookshelfApi:getAuthorItems(author_id)
-    local server, token = credentials()
-    if not server then
-        return unconfigured("getAuthorItems")
-    end
-    local sink = {}
     -- This endpoint takes no limit parameter -- bounded only by the
     -- author's whole bibliography -- so it belongs with the other
     -- unbounded list calls at the large-content timeouts rather than the
     -- argument-less 5s/15s default.
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-    local request = buildRequest(server, token,
-        "/api/authors/" .. util.urlEncode(author_id) .. "?include=items,series",
-        socketutil.table_sink(sink))
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    local response = table.concat(sink)
-    socketutil:reset_timeout()
-    if isConnectionFailure(ok, code) then
-        return connectionFailed("getAuthorItems", code)
+    local outcome, reason = withAuth(function(server, token)
+        return sendTable(server, token,
+            "/api/authors/" .. util.urlEncode(author_id) .. "?include=items,series",
+            socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+    end)
+    if not outcome then
+        return authFailed("getAuthorItems", reason)
     end
-    if isRedirect(code) then
-        return redirected("getAuthorItems", code, status)
+    if isConnectionFailure(outcome.ok, outcome.code) then
+        return connectionFailed("getAuthorItems", outcome.code)
     end
-    if code == 200 and response ~= "" then
+    if isRedirect(outcome.code) then
+        return redirected("getAuthorItems", outcome.code, outcome.status)
+    end
+    if outcome.code == 200 and outcome.body ~= "" then
         -- Keyed on "libraryItems": when `items` is included the server
         -- always sets that field, to an empty array for an author with no
         -- items, so a missing field genuinely is a malformed response
         -- (verified against server source).
-        local result = self:decodeResponse(response, "getAuthorItems", "libraryItems")
+        local result = self:decodeResponse(outcome.body, "getAuthorItems", "libraryItems")
         if not result then
             return nil, "unreadable"
         end
         return result
     end
-    logger.warn("AudiobookshelfApi: cannot get author items", author_id, status or code)
-    ErrorLog:record(T("getAuthorItems: server error: %1", tostring(status or code)))
+    logger.warn("AudiobookshelfApi: cannot get author items", author_id, outcome.status or outcome.code)
+    ErrorLog:record(T("getAuthorItems: server error: %1", tostring(outcome.status or outcome.code)))
     return nil, "server"
 end
 
 -- The library listing always uses minified metadata on current ABS servers.
 -- Batch-get is a read-only POST returning the author/series ID arrays we need.
 function AudiobookshelfApi:getLibraryItemsMetadata(items)
-    local server, token = credentials()
-    if not server then return unconfigured("getLibraryItemsMetadata") end
     local expanded = {}
     for first = 1, #items, ITEMS_PAGE_SIZE do
         local ids, expected = {}, {}
@@ -711,24 +698,30 @@ function AudiobookshelfApi:getLibraryItemsMetadata(items)
             expected[items[i].id] = true
         end
         local body = JSON.encode({ libraryItemIds = ids })
-        local sink = {}
-        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-        local request = buildRequest(server, token, "/api/items/batch/get", socketutil.table_sink(sink))
-        request.method = "POST"
-        request.headers["Content-Type"] = "application/json"
-        request.headers["Content-Length"] = tostring(#body)
-        request.source = ltn12.source.string(body)
-        local ok, code = pcall(function() return socket.skip(1, http.request(request)) end)
-        socketutil:reset_timeout()
-        if isConnectionFailure(ok, code) then
-            return connectionFailed("getLibraryItemsMetadata", code)
+        local outcome, reason = withAuth(function(server, token)
+            return sendTable(server, token, "/api/items/batch/get",
+                socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT,
+                function(request)
+                    request.method = "POST"
+                    request.headers["Content-Type"] = "application/json"
+                    request.headers["Content-Length"] = tostring(#body)
+                    -- A fresh source on every attempt: a consumed ltn12
+                    -- source must never be resent to a retry.
+                    request.source = ltn12.source.string(body)
+                end)
+        end)
+        if not outcome then
+            return authFailed("getLibraryItemsMetadata", reason)
         end
-        if isRedirect(code) then return redirected("getLibraryItemsMetadata", code) end
-        if code ~= 200 then
-            ErrorLog:record("getLibraryItemsMetadata: server error " .. tostring(code))
+        if isConnectionFailure(outcome.ok, outcome.code) then
+            return connectionFailed("getLibraryItemsMetadata", outcome.code)
+        end
+        if isRedirect(outcome.code) then return redirected("getLibraryItemsMetadata", outcome.code) end
+        if outcome.code ~= 200 then
+            ErrorLog:record("getLibraryItemsMetadata: server error " .. tostring(outcome.code))
             return nil, "server"
         end
-        local result = self:decodeResponse(table.concat(sink), "getLibraryItemsMetadata", "libraryItems")
+        local result = self:decodeResponse(outcome.body, "getLibraryItemsMetadata", "libraryItems")
         if not result then return nil, "unreadable" end
         for _, item in ipairs(result) do
             local metadata = type(item) == "table" and type(item.media) == "table" and item.media.metadata
@@ -751,64 +744,47 @@ function AudiobookshelfApi:getLibraryItemsMetadata(items)
 end
 
 function AudiobookshelfApi:getLibraryItem(id)
-    local server, token = credentials()
-    if not server then
-        return unconfigured("getLibraryItem")
+    local outcome, reason = withAuth(function(server, token)
+        return sendTable(server, token, "/api/items/" .. util.urlEncode(id) .. "?expanded=1")
+    end)
+    if not outcome then
+        return authFailed("getLibraryItem", reason)
     end
-    local sink = {}
-    socketutil:set_timeout()
-    local request = buildRequest(server, token,
-        "/api/items/" .. util.urlEncode(id) .. "?expanded=1",
-        socketutil.table_sink(sink))
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    local response = table.concat(sink)
-    socketutil:reset_timeout()
-    if isConnectionFailure(ok, code) then
-        return connectionFailed("getLibraryItem", code)
+    if isConnectionFailure(outcome.ok, outcome.code) then
+        return connectionFailed("getLibraryItem", outcome.code)
     end
-    if isRedirect(code) then
-        return redirected("getLibraryItem", code, status)
+    if isRedirect(outcome.code) then
+        return redirected("getLibraryItem", outcome.code, outcome.status)
     end
-    if code == 200 and response ~= "" then
-        local result = self:decodeResponse(response, "getLibraryItem")
+    if outcome.code == 200 and outcome.body ~= "" then
+        local result = self:decodeResponse(outcome.body, "getLibraryItem")
         if not result then
             return nil, "unreadable"
         end
         return result
     end
-    logger.warn("AudiobookshelfApi: cannot get library item", id ,status or code)
-    ErrorLog:record(T("getLibraryItem: server error: %1", tostring(status or code)))
+    logger.warn("AudiobookshelfApi: cannot get library item", id, outcome.status or outcome.code)
+    ErrorLog:record(T("getLibraryItem: server error: %1", tostring(outcome.status or outcome.code)))
     return nil, "server"
 end
 
 -- CR-F5: the full return contract, so a caller can name the true failure
 -- instead of a single generic message. true, code on success; otherwise
 -- false, reason[, detail], where reason is one of:
---   unconfigured  -- server/token not set;
---   open_failed   -- the staging file could not be opened for writing;
---   connection    -- a transport failure (detail is the LuaSocket error
---                    string, e.g. "timeout");
---   redirect      -- the server answered with a 3xx;
---   server        -- any other non-200 status (detail is the numeric
---                    status);
---   incomplete    -- the transfer did not measure as complete;
---   commit_failed -- the completed staging file could not replace the
---                    destination.
+--   unconfigured    -- neither a session nor an API token is usable;
+--   session_expired -- AUTH-03: the session could not be renewed (401/403
+--                      on /auth/refresh); the session has been cleared;
+--   open_failed     -- the staging file could not be opened for writing;
+--   connection      -- a transport failure (detail is the LuaSocket error
+--                      string, e.g. "timeout") -- on either the download
+--                      itself or the refresh attempt that preceded it;
+--   redirect        -- the server answered with a 3xx;
+--   server          -- any other non-200 status (detail is the numeric
+--                      status);
+--   incomplete      -- the transfer did not measure as complete;
+--   commit_failed   -- the completed staging file could not replace the
+--                      destination.
 function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
-    -- Before the staging file is opened, so an unconfigured plugin leaves
-    -- nothing behind on disk.
-    local server, token = credentials()
-    if not server then
-        unconfigured("downloadFile")
-        return false, "unconfigured"
-    end
-    -- D-01: ebook downloads deliberately have no whole-transfer cap -- a
-    -- large book on slow Wi-Fi can legitimately take longer than any fixed
-    -- limit. This matches KOReader's OPDS downloader. With a negative
-    -- total, socketutil.file_sink below hands back the plain ltn12 file
-    -- sink; the block timeout still fails a connection that stops
-    -- delivering data.
-    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, -1)
     local fullpath = local_path .. "/" .. filename
     -- A-07 gap closure: the destination (fullpath) is never opened for
     -- writing and never removed anywhere in this function. The transfer
@@ -816,65 +792,87 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
     -- the destination only after a verified-complete transfer via the
     -- staging module's commit step -- so a pre-existing good copy survives
     -- every failure mode untouched, which is what 04-UAT.md test 6 found
-    -- missing.
+    -- missing. Computed once, before the first attempt, and reused
+    -- unchanged by a retry (AUTH-03/AUTH-06): each attempt below truncates
+    -- and discards this same path, so a 401's partial bytes are always
+    -- gone before the retry -- and before the refresh in between -- ever
+    -- writes to it again.
     local temp_path = DownloadStaging.tempPathFor(local_path, id, ino)
-    local outfile, err
-    if temp_path then
-        outfile, err = io.open(temp_path, "w")
-    else
-        err = "no_staging_path"
+
+    local function attempt(server, token)
+        -- D-01: ebook downloads deliberately have no whole-transfer cap --
+        -- a large book on slow Wi-Fi can legitimately take longer than any
+        -- fixed limit. This matches KOReader's OPDS downloader. With a
+        -- negative total, socketutil.file_sink below hands back the plain
+        -- ltn12 file sink; the block timeout still fails a connection that
+        -- stops delivering data.
+        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, -1)
+        local outfile, err
+        if temp_path then
+            -- "w" truncates: a retry never appends to a prior attempt's
+            -- bytes, even if the staging file survived somehow.
+            outfile, err = io.open(temp_path, "w")
+        else
+            err = "no_staging_path"
+        end
+        if not outfile then
+            socketutil:reset_timeout()
+            return { open_failed = true, err = err }
+        end
+        local request = buildRequest(server, token,
+            "/api/items/" .. util.urlEncode(id) .. "/file/" .. util.urlEncode(ino) .. "/download",
+            socketutil.file_sink(outfile))
+        local ok, code, headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
+        socketutil:reset_timeout()
+        -- Belt-and-braces close on every path: the sink closes the handle
+        -- only on its own clean end-of-stream signal, so a failed or
+        -- stalled transfer leaves it open; a double close (the success
+        -- path) is harmless, which is why this is wrapped in its own pcall.
+        pcall(function() outfile:close() end)
+        if isConnectionFailure(ok, code) or code ~= 200 then
+            -- Every non-200 outcome discards the staging file here, before
+            -- withAuth ever gets to decide whether to refresh -- so a 401's
+            -- partial bytes are gone before the refresh request is even
+            -- built (AUTH-06). The pre-existing destination, if any, is
+            -- never touched by this branch (A-07).
+            DownloadStaging.discard(temp_path)
+        end
+        return { ok = ok, code = code, headers = headers, status = status }
     end
-    if not outfile then
+
+    local outcome, reason, detail = withAuth(attempt)
+    if not outcome then
+        if reason == "unconfigured" then
+            unconfigured("downloadFile")
+            return false, "unconfigured"
+        end
+        -- Every other reason (session_expired, connection, redirect,
+        -- server, unreadable) came from refreshSession, which has already
+        -- logged and recorded it itself (F33-D7).
+        return false, reason, detail
+    end
+    if outcome.open_failed then
         -- An undrivable staging path and an unopenable staging file are the
         -- same fact from the caller's side (nothing could be opened), so
-        -- both fold into this one existing failure exit. The message now
-        -- names the staging path rather than the destination.
-        logger.warn("AudiobookshelfApi: cannot open local file for writing:", temp_path or fullpath, err)
-        ErrorLog:record(T("downloadFile: could not open local file: %1", tostring(err)))
-        socketutil:reset_timeout()
+        -- both fold into this one failure exit. The message names the
+        -- staging path rather than the destination.
+        logger.warn("AudiobookshelfApi: cannot open local file for writing:", temp_path or fullpath, outcome.err)
+        ErrorLog:record(T("downloadFile: could not open local file: %1", tostring(outcome.err)))
         return false, "open_failed"
     end
-    local request = buildRequest(server, token,
-        "/api/items/" .. util.urlEncode(id) .. "/file/" .. util.urlEncode(ino) .. "/download",
-        socketutil.file_sink(outfile))
-    local ok, code, headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    socketutil:reset_timeout()
-    if isConnectionFailure(ok, code) or code ~= 200 then
-        -- With the uncapped total set above, socketutil.file_sink is the
-        -- plain ltn12 file sink. That sink closes the handle only on a
-        -- clean end-of-stream; a transfer that errors or stalls (LuaSocket
-        -- "timeout" from the block timeout) leaves the handle open, so the
-        -- pcall-wrapped close stays -- a double close is harmless. Every
-        -- non-200 outcome takes this close-and-discard path, so the A-07
-        -- guarantee holds. Close inside its own pcall -- the handle may
-        -- already be invalid -- then discard the staging file, and only
-        -- the staging file. The pre-existing destination, if any, is never
-        -- touched by this branch (A-07). This covers a transport failure
-        -- too (T-e82-02): CR-L1's classification runs before the redirect
-        -- and status checks below, so a caught raise or a non-numeric code
-        -- takes this same close-and-discard path rather than falling
-        -- through to a status comparison that a string code can never match.
-        pcall(function() outfile:close() end)
-        DownloadStaging.discard(temp_path)
-        if isConnectionFailure(ok, code) then
-            connectionFailed("downloadFile", code)
-            return false, "connection", tostring(code)
-        end
-        if isRedirect(code) then
-            redirected("downloadFile", code, status)
-            return false, "redirect"
-        end
-        logger.warn("AudiobookshelfApi: cannot download file:", id , ino, status or code)
-        ErrorLog:record(T("downloadFile: transfer failed: %1", tostring(status or code)))
-        return false, "server", code
+    if isConnectionFailure(outcome.ok, outcome.code) then
+        connectionFailed("downloadFile", outcome.code)
+        return false, "connection", tostring(outcome.code)
     end
-    -- Belt-and-braces close on the success path too. The sink already
-    -- closed the handle on its own clean end-of-stream signal, so this
-    -- will normally raise "attempt to use a closed file" -- which is
-    -- exactly why it is wrapped in its own pcall (a double close is
-    -- harmless). This guarantees the bytes are flushed before anything
-    -- measures or renames the staging file.
-    pcall(function() outfile:close() end)
+    if isRedirect(outcome.code) then
+        redirected("downloadFile", outcome.code, outcome.status)
+        return false, "redirect"
+    end
+    if outcome.code ~= 200 then
+        logger.warn("AudiobookshelfApi: cannot download file:", id, ino, outcome.status or outcome.code)
+        ErrorLog:record(T("downloadFile: transfer failed: %1", tostring(outcome.status or outcome.code)))
+        return false, "server", outcome.code
+    end
     -- GC-07/GC-10: a clean 200 is not by itself proof the whole file
     -- arrived -- a server that closes the connection cleanly after a short
     -- or empty body yields a 200 with a truncated or zero-byte payload and
@@ -892,7 +890,7 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
     -- on the header, it no longer bears on correctness at all). The
     -- decision is a pure comparison over a byte count -- nothing here
     -- opens, parses, decodes, or checksums the staged file (META-04).
-    local declared_length = tonumber(headers and headers["content-length"])
+    local declared_length = tonumber(outcome.headers and outcome.headers["content-length"])
     local actual_size = DownloadStaging.fileSize(temp_path)
     if not DownloadStaging.isCompleteTransfer(actual_size, declared_length) then
         DownloadStaging.discard(temp_path)
@@ -910,46 +908,44 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
         ErrorLog:record(T("downloadFile: could not replace existing file: %1", tostring(commit_reason)))
         return false, "commit_failed"
     end
-    return true, code
+    return true, outcome.code
 end
 
 function AudiobookshelfApi:getLibraryItemCover(id)
-    local server, token = credentials()
-    if not server then
-        unconfigured("getLibraryItemCover")
-        return nil
-    end
-    local sink = {}
     -- Same endpoint/headers as downloadCover, which correctly uses the
     -- larger file-transfer timeouts; align this call so the Book Details
     -- cover thumbnail doesn't time out sooner than the sidecar cover write.
-    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-    local request = buildRequest(server, token,
-        "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
-        socketutil.table_sink(sink))
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    local response = table.concat(sink)
-    socketutil:reset_timeout()
+    local outcome, reason = withAuth(function(server, token)
+        return sendTable(server, token,
+            "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
+            socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    end)
     -- CR-F7/OD-2: logger only in every branch below, all the way through.
     -- A cover that cannot be fetched -- whatever the reason, a transport
-    -- failure, a redirect, a 404, or any other status -- must never
-    -- surface in Settings -> Recent errors, which is a user-facing buffer.
-    if isConnectionFailure(ok, code) then
-        logger.warn("AudiobookshelfApi: http request failed in getLibraryItemCover:", code)
-        return nil, code
+    -- failure, a redirect, a 404, an unrenewable session, or any other
+    -- status -- must never surface in Settings -> Recent errors, which is
+    -- a user-facing buffer. (refreshSession still records its own F33-D7
+    -- entry on a genuine session failure; this method adds nothing more.)
+    if not outcome then
+        logger.warn("AudiobookshelfApi: getLibraryItemCover could not renew the session:", id, reason)
+        return nil, reason
     end
-    if isRedirect(code) then
-        logger.warn("AudiobookshelfApi: server redirected in getLibraryItemCover:", status or code)
+    if isConnectionFailure(outcome.ok, outcome.code) then
+        logger.warn("AudiobookshelfApi: http request failed in getLibraryItemCover:", outcome.code)
+        return nil, outcome.code
+    end
+    if isRedirect(outcome.code) then
+        logger.warn("AudiobookshelfApi: server redirected in getLibraryItemCover:", outcome.status or outcome.code)
         return nil
     end
-    if code == 200 and response ~= "" then
-        local result = RenderImage:renderImageData(response, #response)
+    if outcome.code == 200 and outcome.body ~= "" then
+        local result = RenderImage:renderImageData(outcome.body, #outcome.body)
         return result
     end
-    logger.warn("AudiobookshelfApi: cannot get library item cover", id ,status or code)
+    logger.warn("AudiobookshelfApi: cannot get library item cover", id, outcome.status or outcome.code)
     -- Second value is the numeric HTTP status, so CoverCache can tell a
     -- definite 404 (D-02) from every other failure mode.
-    return nil, code
+    return nil, outcome.code
 end
 
 -- Mirrors downloadFile's file-sink shape (raw bytes to disk), not
@@ -958,87 +954,93 @@ end
 -- re-encoding back to webp is both lossy and unsolved in this codebase
 -- (META-03/META-04). Same URL, same headers as getLibraryItemCover.
 function AudiobookshelfApi:downloadCover(id, local_path)
-    local server, token = credentials()
-    if not server then
-        -- Same guard testConnection uses, but no ErrorLog:record (OD-2): a
-        -- missing/failed cover must never surface in Settings -> Recent
-        -- errors, which is a user-facing buffer. logger.warn only.
-        logger.warn("AudiobookshelfApi: cannot download cover, server/token not configured:", id)
-        return false
-    end
-    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-    local outfile, err = io.open(local_path, "w")
-    if not outfile then
-        -- No ErrorLog:record here (OD-2): a missing/failed cover must never
-        -- surface in Settings -> Recent errors, which is a user-facing
-        -- buffer. logger.warn only, with the item id and reason.
-        logger.warn("AudiobookshelfApi: cannot open local cover file for writing:", local_path, err)
+    local function attempt(server, token)
+        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        local outfile, err = io.open(local_path, "w")
+        if not outfile then
+            socketutil:reset_timeout()
+            return { open_failed = true, err = err }
+        end
+        local request = buildRequest(server, token,
+            "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
+            socketutil.file_sink(outfile))
+        local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
         socketutil:reset_timeout()
+        -- Same close+remove cleanup on failure as downloadFile, for the
+        -- same reason: the sink only closes the handle on a clean
+        -- end-of-stream or its own sink timeout.
+        pcall(function() outfile:close() end)
+        if isConnectionFailure(ok, code) or code ~= 200 then
+            os.remove(local_path)
+        end
+        return { ok = ok, code = code, status = status }
+    end
+
+    local outcome, reason = withAuth(attempt)
+    -- OD-2: a missing/failed cover must never surface in Settings -> Recent
+    -- errors, which is a user-facing buffer -- whatever the reason,
+    -- including an unrenewable session (refreshSession still records its
+    -- own F33-D7 entry on a genuine session failure; nothing more is added
+    -- here).
+    if not outcome then
+        logger.warn("AudiobookshelfApi: cannot download cover, session unusable:", id, reason)
         return false
     end
-    local request = buildRequest(server, token,
-        "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
-        socketutil.file_sink(outfile))
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    socketutil:reset_timeout()
-    if isConnectionFailure(ok, code) or code ~= 200 then
-        -- Same close+remove cleanup as downloadFile, for the same reason:
-        -- the sink only closes the handle on a clean end-of-stream or its
-        -- own sink timeout.
-        pcall(function() outfile:close() end)
-        os.remove(local_path)
+    if outcome.open_failed then
+        -- No ErrorLog:record here (OD-2). logger.warn only, with the item
+        -- id and reason.
+        logger.warn("AudiobookshelfApi: cannot open local cover file for writing:", local_path, outcome.err)
+        return false
+    end
+    if isConnectionFailure(outcome.ok, outcome.code) or outcome.code ~= 200 then
         -- isConnectionFailure only picks the logger wording here (OD-2:
         -- still no ErrorLog either way) -- a caught raise or a non-numeric
         -- code is a transport failure, not an HTTP status.
-        if isConnectionFailure(ok, code) then
-            logger.warn("AudiobookshelfApi: cannot download cover, connection failed:", id, code)
+        if isConnectionFailure(outcome.ok, outcome.code) then
+            logger.warn("AudiobookshelfApi: cannot download cover, connection failed:", id, outcome.code)
         else
-            logger.warn("AudiobookshelfApi: cannot download cover:", id, status or code)
+            logger.warn("AudiobookshelfApi: cannot download cover:", id, outcome.status or outcome.code)
         end
         -- Second value is the numeric HTTP status when the server answered,
         -- or a transport error string otherwise ("sink timeout", "timeout",
         -- or the caught error) -- CoverCache uses this to tell a definite
         -- 404 (D-02) from every other failure mode.
-        return false, code
+        return false, outcome.code
     end
     return true
 end
 
 function AudiobookshelfApi:getSearchResults(id, search_query)
-    local server, token = credentials()
-    if not server then
-        return unconfigured("getSearchResults")
-    end
-    local sink = {}
     local url_encoded_search_string = util.urlEncode(search_query)
-    -- This is a raised-limit search response on possibly-weak Wi-Fi -- use
-    -- the large-content timeouts rather than the argument-less 5s/15s
-    -- default.
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     -- The `filter` parameter that used to sit here is dead: the search
     -- controller behind this endpoint reads only the query text and the
     -- limit (verified against server source at release v2.36.0), so the
     -- plugin was paying for a parameter that did nothing. The ebook test is
     -- applied client-side against the frame-cached snapshot instead
     -- (D-15/SRCH-07).
-    local request = buildRequest(server, token,
-        "/api/libraries/" .. util.urlEncode(id) .. "/search?q=" .. url_encoded_search_string .. "&limit=" .. SEARCH_GROUP_LIMIT,
-        socketutil.table_sink(sink))
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    local response = table.concat(sink)
-    socketutil:reset_timeout()
-    if isConnectionFailure(ok, code) then
-        return connectionFailed("getSearchResults", code)
+    local outcome, reason = withAuth(function(server, token)
+        -- This is a raised-limit search response on possibly-weak Wi-Fi --
+        -- use the large-content timeouts rather than the argument-less
+        -- 5s/15s default.
+        return sendTable(server, token,
+            "/api/libraries/" .. util.urlEncode(id) .. "/search?q=" .. url_encoded_search_string .. "&limit=" .. SEARCH_GROUP_LIMIT,
+            socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+    end)
+    if not outcome then
+        return authFailed("getSearchResults", reason)
     end
-    if isRedirect(code) then
-        return redirected("getSearchResults", code, status)
+    if isConnectionFailure(outcome.ok, outcome.code) then
+        return connectionFailed("getSearchResults", outcome.code)
     end
-    if code == 200 and response ~= "" then
+    if isRedirect(outcome.code) then
+        return redirected("getSearchResults", outcome.code, outcome.status)
+    end
+    if outcome.code == 200 and outcome.body ~= "" then
         -- D-13's derived rule: a search response is malformed only when the
         -- top-level decode fails or is not a table. An absent or empty
         -- group key is not malformed -- it means only that the group
         -- matched nothing -- so no key is validated here.
-        local result = self:decodeResponse(response, "getSearchResults")
+        local result = self:decodeResponse(outcome.body, "getSearchResults")
         if not result then
             return nil, "unreadable"
         end
@@ -1057,63 +1059,86 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
         end
         return result
     end
-    logger.warn("AudiobookshelfApi: cannot search library", id, status or code)
-    ErrorLog:record(T("getSearchResults: server error: %1", tostring(status or code)))
+    logger.warn("AudiobookshelfApi: cannot search library", id, outcome.status or outcome.code)
+    ErrorLog:record(T("getSearchResults: server error: %1", tostring(outcome.status or outcome.code)))
     return nil, "server"
 end
 
 function AudiobookshelfApi:testConnection()
     -- CR-F4: normalized before the empty check, so a stored value of only
-    -- slashes reads as not set rather than as a URL to dial.
+    -- slashes reads as not set rather than as a URL to dial. Kept verbatim.
     local server = normalizeServerUrl(Settings:read("server"))
-    local token = Settings:read("token")
     if not server or server == "" then
         local message = _("Server URL is not set")
         logger.warn("AudiobookshelfApi: testConnection called with no server URL configured")
         ErrorLog:record(message)
         return false, message
     end
-    if not token or token == "" then
-        local message = _("API token is not set")
-        logger.warn("AudiobookshelfApi: testConnection called with no API token configured")
+    -- AUTH-05: neither a session nor an API token is usable.
+    local _server, _bearer, mode = credentials()
+    if not mode then
+        local message = _("Sign in or set an API token first")
+        logger.warn("AudiobookshelfApi: testConnection called with no sign-in or API token configured")
         ErrorLog:record(message)
         return false, message
     end
-    local sink = {}
-    socketutil:set_timeout()
-    local request = buildRequest(server, token, "/api/me", socketutil.table_sink(sink))
-    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
-    socketutil:reset_timeout()
-    if isConnectionFailure(ok, code) then
-        connectionFailed("testConnection", code)
-        return false, T(_("Could not reach the server (%1). Check the server URL and your Wi-Fi connection."),
-            tostring(code))
+    local outcome, reason, detail = withAuth(function(req_server, token)
+        return sendTable(req_server, token, "/api/me")
+    end)
+    if not outcome then
+        local message
+        if reason == "session_expired" then
+            -- refreshSession already recorded this itself (F33-D7); do not
+            -- record it again here.
+            message = _("Your sign-in has expired. Sign in again.")
+        elseif reason == "connection" then
+            message = T(_("Could not reach the server (%1). Check the server URL and your Wi-Fi connection."),
+                tostring(detail))
+            ErrorLog:record(message)
+        elseif reason == "redirect" then
+            message = _("The server redirected the request instead of answering it. Check the URL (http vs https, extra path), or sign in to the Wi-Fi network first.")
+            ErrorLog:record(message)
+        else
+            message = T(_("Could not renew your sign-in (%1). Try again in a few minutes."), tostring(detail or reason))
+            ErrorLog:record(message)
+        end
+        return false, message
     end
-    if code == 200 then
+    if isConnectionFailure(outcome.ok, outcome.code) then
+        connectionFailed("testConnection", outcome.code)
+        return false, T(_("Could not reach the server (%1). Check the server URL and your Wi-Fi connection."),
+            tostring(outcome.code))
+    end
+    if outcome.code == 200 then
         return true, nil
     end
-    if isRedirect(code) then
+    if isRedirect(outcome.code) then
         -- The one place a redirect gets a full sentence: this is the check a
         -- user runs when something is wrong, so name the two usual causes.
         local message = _("The server redirected the request instead of answering it. Check the URL (http vs https, extra path), or sign in to the Wi-Fi network first.")
-        logger.warn("AudiobookshelfApi: testConnection redirected:", status or code)
+        logger.warn("AudiobookshelfApi: testConnection redirected:", outcome.status or outcome.code)
         ErrorLog:record(message)
         return false, message
     end
-    if code == 401 then
-        local message = _("Invalid or expired API token")
-        logger.warn("AudiobookshelfApi: testConnection unauthorized:", status or code)
+    if outcome.code == 401 then
+        -- AUTH-05: a 401 here already survived withAuth's one refresh
+        -- attempt (session mode) or never had a session to refresh (token
+        -- mode), so this is a genuine rejection either way.
+        local message = (mode == "session")
+            and _("The server rejected your sign-in. Sign in again.")
+            or _("Invalid or expired API token")
+        logger.warn("AudiobookshelfApi: testConnection unauthorized:", outcome.status or outcome.code)
         ErrorLog:record(message)
         return false, message
     end
-    if code == 404 then
+    if outcome.code == 404 then
         local message = _("Server reached, but it does not support this connection check. Try browsing a library instead.")
-        logger.warn("AudiobookshelfApi: testConnection endpoint not found:", status or code)
+        logger.warn("AudiobookshelfApi: testConnection endpoint not found:", outcome.status or outcome.code)
         ErrorLog:record(message)
         return false, message
     end
-    local message = tostring(status or code)
-    logger.warn("AudiobookshelfApi: testConnection failed:", status or code)
+    local message = tostring(outcome.status or outcome.code)
+    logger.warn("AudiobookshelfApi: testConnection failed:", outcome.status or outcome.code)
     ErrorLog:record(T("testConnection: unexpected error: %1", message))
     return false, message
 end

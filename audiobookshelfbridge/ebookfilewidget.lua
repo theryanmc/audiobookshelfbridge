@@ -48,7 +48,9 @@ local EbookFileWidget = InputContainer:extend{
 -- below can call _()/T() directly.
 function EbookFileWidget.downloadFailureText(reason, detail, path)
     if reason == "unconfigured" then
-        return _("Set your server URL and API token in Settings before downloading.")
+        return _("Set your server URL and sign in (or add an API token) in Settings before downloading.")
+    elseif reason == "session_expired" then
+        return _("Your sign-in has expired. Sign in again in Settings, then retry the download.")
     elseif reason == "redirect" then
         return _("The server redirected the download. Check the server URL, or sign in to the Wi-Fi network first.")
     elseif reason == "connection" then

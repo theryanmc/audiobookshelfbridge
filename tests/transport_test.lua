@@ -319,6 +319,17 @@ local default_msg = EbookFileWidget.downloadFailureText("totally_unknown", nil, 
 assert(type(default_msg) == "string" and #default_msg > 0)
 print("PASS: downloadFailureText gives every reason its own message, unknown reasons get a default")
 
+-- AUTH-03/AUTH-06: session_expired gets its own message, distinct from
+-- every other reason above.
+local session_expired_msg = EbookFileWidget.downloadFailureText("session_expired", nil, "/x")
+assert(type(session_expired_msg) == "string" and #session_expired_msg > 0)
+assert(session_expired_msg ~= distinct.unconfigured)
+assert(session_expired_msg ~= distinct.redirect)
+assert(session_expired_msg ~= distinct.incomplete)
+assert(session_expired_msg ~= distinct.server)
+assert(session_expired_msg ~= timeout_msg)
+print("PASS: downloadFailureText(session_expired) is its own message, distinct from every other reason")
+
 -- Full download flow: http stub times out.
 ui_events = {}
 infomessage_calls = {}

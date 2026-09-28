@@ -56,6 +56,8 @@ function BookDetailsWidget:init()
         local text = _("Could not load book details. Check network and settings.")
         if reason == "unreadable" then
             text = _("Audiobookshelf sent a response this plugin could not read. See Recent errors in Settings.")
+        elseif reason == "session_expired" then
+            text = _("Your sign-in has expired. Sign in again in Settings.")
         end
         UIManager:show(InfoMessage:new{
             text = text,

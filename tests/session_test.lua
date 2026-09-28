@@ -65,13 +65,14 @@ package.loaded.logger = {
     dbg = function() end,
 }
 
-package.loaded["audiobookshelfbridge/downloadstaging"] = {
-    tempPathFor = function() return nil end,
-    fileSize = function() return nil end,
-    isCompleteTransfer = function() return false end,
-    discard = function() end,
-    commit = function() return false, "unused" end,
-}
+-- AUTH-06: downloadstaging.lua has zero requires, so the REAL module is
+-- loaded here (not stubbed) against a throwaway directory -- this is what
+-- lets the download tests below assert real byte survival on disk.
+local STAGING_DIR = os.tmpname()
+os.remove(STAGING_DIR)
+os.execute("mkdir -p " .. STAGING_DIR)
+local DownloadStaging = dofile("audiobookshelfbridge/downloadstaging.lua")
+package.loaded["audiobookshelfbridge/downloadstaging"] = DownloadStaging
 
 -- Settings: a table-backed store. write(key, nil) deletes, matching
 -- LuaSettings:saveSetting(key, nil). Every written key is appended to
@@ -114,6 +115,7 @@ local SIMPLE_BODIES = {
     LOGIN_LEGACY = function() return { user = { token = "legacy-non-expiring-token" } } end,
     REFRESH_OK = function() return { user = { accessToken = "ACCESS-TWO", refreshToken = "REFRESH-TWO" } } end,
     LIBS = function() return { libraries = { { id = "lib1", name = "Library One" } } } end,
+    ITEM = function() return { id = "item1", title = "Item One" } end,
 }
 package.loaded.json = {
     encode = function(t)
@@ -203,15 +205,78 @@ local function libsResponse(request)
     error("session_test: unhandled libs response mode " .. tostring(resp.mode))
 end
 
+-- Task 2 additions: getLibraryItem, downloadFile, downloadCover and
+-- testConnection each hit their own endpoint.
+local ITEM_RESPONSES, DOWNLOAD_MODE, COVER_MODE, ME_MODE = {}, "ok", "ok", "ok"
+local item_requests, download_requests, cover_requests, me_requests = {}, {}, {}, {}
+-- Set to a staging path before a scenario that must prove the file is gone
+-- by the time the refresh request is sent (AUTH-06).
+local EXPECT_STAGING_GONE = nil
+
+local function itemResponse(request)
+    table.insert(item_requests, request)
+    assert(request.method == "GET")
+    local resp = table.remove(ITEM_RESPONSES, 1) or { mode = "ok" }
+    if resp.mode == "401" then return 1, 401 end
+    if resp.mode == "ok" then request.sink("ITEM"); return 1, 200 end
+    error("session_test: unhandled item response mode " .. tostring(resp.mode))
+end
+
+local function downloadResponse(request)
+    table.insert(download_requests, request)
+    assert(request.method == "GET")
+    if DOWNLOAD_MODE == "unauthorized" then
+        request.sink("UNAUTHORIZED")
+        return 1, 401
+    end
+    if DOWNLOAD_MODE == "timeout" then return nil, "timeout" end
+    if DOWNLOAD_MODE == "ok" then
+        request.sink("EPUBDATA")
+        return 1, 200
+    end
+    error("session_test: unhandled DOWNLOAD_MODE " .. tostring(DOWNLOAD_MODE))
+end
+
+local function coverResponse(request)
+    table.insert(cover_requests, request)
+    assert(request.method == "GET")
+    if COVER_MODE == "unauthorized" then return 1, 401 end
+    if COVER_MODE == "ok" then request.sink("COVERBYTES"); return 1, 200 end
+    error("session_test: unhandled COVER_MODE " .. tostring(COVER_MODE))
+end
+
+local function meResponse(request)
+    table.insert(me_requests, request)
+    assert(request.method == "GET")
+    if ME_MODE == "401" then return 1, 401 end
+    if ME_MODE == "ok" then return 1, 200 end
+    error("session_test: unhandled ME_MODE " .. tostring(ME_MODE))
+end
+
 package.loaded["socket.http"] = {
     request = function(request)
         local url = request.url
         if url:find("/login", 1, true) then
             return loginResponse(request)
         elseif url:find("/auth/refresh", 1, true) then
+            -- AUTH-06: whichever download scenario is currently proving
+            -- "discarded before the refresh" gets checked right here,
+            -- before the refresh's own response is even decided.
+            if EXPECT_STAGING_GONE then
+                assert(not io.open(EXPECT_STAGING_GONE, "r"),
+                    "the staging file must be discarded before the refresh request is sent")
+            end
             return refreshResponse(request)
         elseif url:find("/logout", 1, true) then
             return logoutResponse(request)
+        elseif url:find("/file/", 1, true) then
+            return downloadResponse(request)
+        elseif url:find("/cover", 1, true) then
+            return coverResponse(request)
+        elseif url:find("/api/items/", 1, true) then
+            return itemResponse(request)
+        elseif url:find("/api/me", 1, true) then
+            return meResponse(request)
         elseif url:find("/api/libraries", 1, true) then
             return libsResponse(request)
         end
@@ -312,7 +377,10 @@ local function resetAll()
         table.insert(write_order, key)
     end
     login_requests, refresh_requests, libs_requests, logout_requests = {}, {}, {}, {}
+    item_requests, download_requests, cover_requests, me_requests = {}, {}, {}, {}
     LIBS_RESPONSES = {}
+    ITEM_RESPONSES = {}
+    EXPECT_STAGING_GONE = nil
     ui_events = {}
     infomessage_calls = {}
     confirmbox_calls = {}
@@ -639,7 +707,175 @@ assert(Api:signOut() == nil)
 assert(#logout_requests == 0)
 print("PASS: signOut with no session to revoke sends nothing")
 
--- 8. Browser session_expired / unconfigured routing ------------------------
+-- 8. Task 2: every remaining request, both file sinks, and Test connection
+--    renew an expired session exactly once and retry exactly once. -------
+
+-- getLibraryItem (representative of getAuthorItems/getSearchResults/
+-- getLibraryItemsMetadata, which all share the exact same withAuth +
+-- sendTable attempt shape already proven end-to-end via getLibraries).
+signInFreshSession()
+ITEM_RESPONSES = { { mode = "401" }, { mode = "ok" } }
+REFRESH_MODE = "ok"
+local item_result = Api:getLibraryItem("item1")
+assert(item_result and item_result.id == "item1")
+assert(#item_requests == 2 and #refresh_requests == 1)
+assert(item_requests[1].headers["Authorization"] == "Bearer ACCESS-ONE")
+assert(item_requests[2].headers["Authorization"] == "Bearer ACCESS-TWO")
+print("PASS: getLibraryItem renews an expired access token once and retries once")
+
+-- downloadFile: first-attempt 401, discarded before the refresh, retry
+-- writes the real file, no staging file survives.
+signInFreshSession()
+DOWNLOAD_MODE = "unauthorized"
+REFRESH_MODE = "ok"
+local dest_path = STAGING_DIR .. "/book.epub"
+local expected_temp = DownloadStaging.tempPathFor(STAGING_DIR, "item1", "ino1")
+EXPECT_STAGING_GONE = expected_temp
+download_requests = {}
+-- Flip to "ok" only for the retry: the http stub dispatch already routed
+-- the first attempt through "unauthorized" above by the time this line
+-- runs (both attempts share DOWNLOAD_MODE, so the retry must see "ok").
+-- Since withAuth's retry happens synchronously inside this one call, set
+-- the mode to a sequence instead of a bare string.
+local DOWNLOAD_SEQUENCE = { "unauthorized", "ok" }
+local original_download_dispatch = downloadResponse
+downloadResponse = function(request)
+    DOWNLOAD_MODE = table.remove(DOWNLOAD_SEQUENCE, 1) or "ok"
+    return original_download_dispatch(request)
+end
+local dl_ok, dl_code = Api:downloadFile("item1", "ino1", "book.epub", STAGING_DIR)
+downloadResponse = original_download_dispatch
+EXPECT_STAGING_GONE = nil
+assert(dl_ok == true and dl_code == 200)
+assert(#download_requests == 2 and #refresh_requests == 1)
+local committed = io.open(dest_path, "rb")
+assert(committed, "the destination file must exist after a successful retry")
+assert(committed:read("*a") == "EPUBDATA")
+committed:close()
+assert(not io.open(expected_temp, "r"), "no staging file must remain after a successful commit")
+os.remove(dest_path)
+print("PASS: downloadFile discards the staging file before the refresh, then retries into a fresh file")
+
+-- downloadFile: refresh 401 -- session_expired, staging gone, a
+-- pre-existing destination survives untouched.
+signInFreshSession()
+DOWNLOAD_MODE = "unauthorized"
+REFRESH_MODE = "401"
+local preexisting = io.open(dest_path, "w")
+preexisting:write("ORIGINAL-BYTES")
+preexisting:close()
+local dl2_ok, dl2_reason = Api:downloadFile("item1", "ino1", "book.epub", STAGING_DIR)
+assert(dl2_ok == false and dl2_reason == "session_expired")
+assert(settings_table.auth == nil, "refresh 401 must clear the session")
+local kept = io.open(dest_path, "rb")
+assert(kept:read("*a") == "ORIGINAL-BYTES", "a failed retry must never touch the pre-existing destination")
+kept:close()
+os.remove(dest_path)
+print("PASS: downloadFile refresh-401 clears the session and leaves a pre-existing destination untouched")
+
+-- downloadFile: refresh timeout -- connection, session kept.
+signInFreshSession()
+DOWNLOAD_MODE = "unauthorized"
+REFRESH_MODE = "timeout"
+local dl3_ok, dl3_reason, dl3_detail = Api:downloadFile("item1", "ino1", "book.epub", STAGING_DIR)
+assert(dl3_ok == false and dl3_reason == "connection" and dl3_detail == "timeout")
+assert(settings_table.auth == "session", "a flaky refresh must keep the session")
+REFRESH_MODE = "ok"
+print("PASS: downloadFile refresh-timeout reports connection and keeps the session")
+
+-- downloadFile: no credentials at all -- unconfigured, no file created.
+resetAll()
+local dl4_ok, dl4_reason = Api:downloadFile("item1", "ino1", "book.epub", STAGING_DIR)
+assert(dl4_ok == false and dl4_reason == "unconfigured")
+assert(not io.open(dest_path, "r"))
+print("PASS: downloadFile with no credentials creates no file")
+
+-- downloadCover: 401 then refresh then retry succeeds; a refresh 401
+-- leaves no cover file behind.
+signInFreshSession()
+local cover_path = STAGING_DIR .. "/cover.webp"
+local COVER_SEQUENCE = { "unauthorized", "ok" }
+local original_cover_dispatch = coverResponse
+coverResponse = function(request)
+    COVER_MODE = table.remove(COVER_SEQUENCE, 1) or "ok"
+    return original_cover_dispatch(request)
+end
+REFRESH_MODE = "ok"
+local cov_ok = Api:downloadCover("item1", cover_path)
+coverResponse = original_cover_dispatch
+assert(cov_ok == true)
+local cov_file = io.open(cover_path, "rb")
+assert(cov_file:read("*a") == "COVERBYTES")
+cov_file:close()
+os.remove(cover_path)
+
+signInFreshSession()
+COVER_MODE = "unauthorized"
+REFRESH_MODE = "401"
+local cov2_ok = Api:downloadCover("item1", cover_path)
+assert(cov2_ok == false)
+assert(not io.open(cover_path, "r"), "a refresh failure must leave no cover file behind")
+REFRESH_MODE = "ok"
+print("PASS: downloadCover renews and retries on a 401, and a refresh failure leaves no file behind")
+
+-- testConnection: every mode in both session and token configurations.
+signInFreshSession()
+ME_MODE = "ok"
+local tc1_ok = Api:testConnection()
+assert(tc1_ok == true)
+
+signInFreshSession()
+local ME_SEQUENCE = { "401", "ok" }
+local original_me_dispatch = meResponse
+meResponse = function(request)
+    ME_MODE = table.remove(ME_SEQUENCE, 1) or "ok"
+    return original_me_dispatch(request)
+end
+REFRESH_MODE = "ok"
+local tc2_ok = Api:testConnection()
+meResponse = original_me_dispatch
+assert(tc2_ok == true, "a 401 then a successful refresh must still report success")
+
+signInFreshSession()
+ME_MODE = "401"
+REFRESH_MODE = "401"
+local tc3_ok, tc3_msg = Api:testConnection()
+assert(tc3_ok == false and tc3_msg:lower():find("sign in", 1, true))
+
+signInFreshSession()
+ME_MODE = "401"
+REFRESH_MODE = "timeout"
+local tc4_ok, tc4_msg = Api:testConnection()
+assert(tc4_ok == false and tc4_msg:find("Could not reach the server", 1, true))
+REFRESH_MODE = "ok"
+
+-- A second 401 on the retry itself (session mode) is a genuine rejection.
+signInFreshSession()
+local ME_SEQUENCE2 = { "401", "401" }
+local original_me_dispatch2 = meResponse
+meResponse = function(request)
+    ME_MODE = table.remove(ME_SEQUENCE2, 1) or "401"
+    return original_me_dispatch2(request)
+end
+REFRESH_MODE = "ok"
+local tc5_ok, tc5_msg = Api:testConnection()
+meResponse = original_me_dispatch2
+assert(tc5_ok == false and tc5_msg:lower():find("sign in", 1, true))
+
+resetAll()
+settings_table.server = "https://books.example.com"
+local tc6_ok, tc6_msg = Api:testConnection()
+assert(tc6_ok == false and tc6_msg:lower():find("sign in", 1, true) and tc6_msg:lower():find("token", 1, true))
+
+resetAll()
+settings_table.server = "https://books.example.com"
+settings_table.token = "APITOKEN-SECRET"
+ME_MODE = "401"
+local tc7_ok, tc7_msg = Api:testConnection()
+assert(tc7_ok == false and tc7_msg == "Invalid or expired API token")
+print("PASS: testConnection renews an expired access token and reports a distinct message per failure")
+
+-- 9. Browser session_expired / unconfigured routing ------------------------
 
 package.loaded["audiobookshelfbridge/settingsmenu"] = {
     new = function(_self, t) return t end,
@@ -659,7 +895,7 @@ browser:showApiFailure("unconfigured", "fallback")
 assert(#infomessage_calls == 1)
 print("PASS: browser routes session_expired and unconfigured to Settings with a matching message")
 
--- 9. Secret scan -----------------------------------------------------------
+-- 10. Secret scan -----------------------------------------------------------
 
 local FORBIDDEN = { "PASSWORD-SECRET", "ACCESS-ONE", "ACCESS-TWO", "REFRESH-ONE", "REFRESH-TWO", "APITOKEN-SECRET" }
 
@@ -696,3 +932,7 @@ for _, v in pairs(settings_table) do
     end
 end
 print("PASS: no secret (password, access/refresh tokens, API token) ever reaches a log, error, or on-screen message")
+
+-- Cleanup: remove the throwaway staging directory used by the download
+-- tests above.
+os.execute("rm -rf " .. STAGING_DIR)
