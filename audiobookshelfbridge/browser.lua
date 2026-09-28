@@ -128,6 +128,26 @@ function AudiobookshelfBrowser:onLeftButtonTap()
     UIManager:show(SettingsMenu:new{})
 end
 
+-- GKC-D3/GKC-D4: shows the one-time API-token fallback notice, if one is
+-- pending, after every API call the browser makes below. Deferred one
+-- tick: the first caller (genItemTableFromLibraries) runs from init(),
+-- before this browser is even on screen, and every other loader below
+-- pushes or shows its own result synchronously right after its request --
+-- deferring here lands the notice on top of whatever that loader just
+-- showed, rather than underneath it.
+function AudiobookshelfBrowser:showFallbackNotice()
+    local notice = AudiobookshelfApi:takeFallbackNotice()
+    if not notice then
+        return
+    end
+    UIManager:nextTick(function()
+        UIManager:show(InfoMessage:new{
+            text = notice,
+            timeout = 3,
+        })
+    end)
+end
+
 -- Cover tiles apply to any level that contains at least one book.
 --
 -- This deliberately does not require every row to be a book. Search results
@@ -181,6 +201,9 @@ end
 function AudiobookshelfBrowser:updateItems(select_number, no_recalculate_dimen)
     if self:gridEnabled() then
         local ok, err = pcall(CoverGrid.updateItems, self, select_number, no_recalculate_dimen)
+        -- Cover tiles are fetched synchronously inside the call above, even
+        -- when it later raises, so the notice check runs unconditionally.
+        self:showFallbackNotice()
         if ok then
             return
         end
@@ -221,6 +244,7 @@ function AudiobookshelfBrowser:switchLibraryTab(tab)
         NetworkMgr:runWhenOnline(function()
             if self.level ~= "library" or self.library_items ~= items or self.item_table ~= origin then return end
             local expanded, reason = AudiobookshelfApi:getLibraryItemsMetadata(items)
+            self:showFallbackNotice()
             if not expanded then
                 self:showApiFailure(reason, _("Could not load authors and series. Check network and try again."))
                 return
@@ -250,6 +274,7 @@ end
 function AudiobookshelfBrowser:genItemTableFromLibraries()
     local item_table = {}
     local libraries, reason = AudiobookshelfApi:getLibraries()
+    self:showFallbackNotice()
     if not libraries then
         self:showApiFailure(reason, _("Could not reach Audiobookshelf server. Check network and settings."))
         return item_table, false
@@ -316,6 +341,20 @@ function AudiobookshelfBrowser:showApiFailure(reason, fallback_text)
         end)
         return
     end
+    if reason == "token_rejected" then
+        -- GKC-D2: mirrors the session_expired branch above -- the sign-in
+        -- could not be renewed and the stored API token was rejected too,
+        -- so there is nothing left to retry; route to Settings the same
+        -- way.
+        UIManager:nextTick(function()
+            UIManager:show(SettingsMenu:new{})
+            UIManager:show(InfoMessage:new{
+                text = _("Your sign-in expired and the server rejected your API token. Sign in again or update the API token in Settings."),
+                timeout = 3,
+            })
+        end)
+        return
+    end
     local text = fallback_text
     if reason == "unreadable" then
         text = _("Audiobookshelf sent a response this plugin could not read. See Recent errors in Settings.")
@@ -359,6 +398,9 @@ function AudiobookshelfBrowser:onMenuSelect(item)
                     self:onCloseAllMenus()
                 end,
             }
+            -- init already fetched the item and, through getDetailsContent,
+            -- the cover (D-14); take the notice now, right after.
+            self:showFallbackNotice()
             -- init has already told the user why the load failed; don't
             -- show an empty widget that would swallow input.
             if bookdetailswidget.load_failed then return end
@@ -536,6 +578,7 @@ function AudiobookshelfBrowser:loadLibrarySearch(search)
     -- is what made the previous code conflate "no book group" with
     -- "malformed" (D-13's derived rule below).
     local results, reason = AudiobookshelfApi:getSearchResults(self.library_id, search)
+    self:showFallbackNotice()
     if not results then
         self:showApiFailure(reason, _("Search failed. Check network and settings."))
         return
@@ -633,6 +676,7 @@ end
 
 function AudiobookshelfBrowser:openLibrary(id, name)
     local libraryItems, reason = AudiobookshelfApi:getLibraryItems(id)
+    self:showFallbackNotice()
     if not libraryItems then
         self:showApiFailure(reason, _("Could not load library. Check network and settings."))
         return false
@@ -667,6 +711,7 @@ function AudiobookshelfBrowser:ensureEbookIds(library_id)
     end
     -- Refetch exactly once. No second retry -- D-16 is refetch-once-then-fail.
     local items, reason = AudiobookshelfApi:getLibraryItems(library_id)
+    self:showFallbackNotice()
     if items then
         local ebook_ids = {}
         for _, item in ipairs(items) do
@@ -697,6 +742,7 @@ function AudiobookshelfBrowser:openSeries(series_id, series_name, library_id)
     end
 
     local items, reason = AudiobookshelfApi:getSeriesItems(library_id, series_id)
+    self:showFallbackNotice()
     if not items then
         self:showApiFailure(reason, _("Could not load this series. Check network and settings."))
         return false
@@ -783,6 +829,7 @@ function AudiobookshelfBrowser:openAuthor(author_id, author_name, library_id)
     end
 
     local items, reason = AudiobookshelfApi:getAuthorItems(author_id)
+    self:showFallbackNotice()
     if not items then
         self:showApiFailure(reason, _("Could not load this author. Check network and settings."))
         return false

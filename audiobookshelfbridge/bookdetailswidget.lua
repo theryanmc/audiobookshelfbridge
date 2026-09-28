@@ -58,6 +58,11 @@ function BookDetailsWidget:init()
             text = _("Audiobookshelf sent a response this plugin could not read. See Recent errors in Settings.")
         elseif reason == "session_expired" then
             text = _("Your sign-in has expired. Sign in again in Settings.")
+        elseif reason == "token_rejected" then
+            -- GKC-D2: shares the browser's msgid so one translation covers
+            -- both. No notice handling here -- the browser takes the
+            -- notice right after constructing this widget (GKC-D4).
+            text = _("Your sign-in expired and the server rejected your API token. Sign in again or update the API token in Settings.")
         end
         UIManager:show(InfoMessage:new{
             text = text,

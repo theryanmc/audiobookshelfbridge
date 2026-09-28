@@ -134,6 +134,11 @@ local function clearSession()
     Settings:write("session_host", nil)
 end
 
+-- GKC-D3: consumed-once flag for the API-token fallback notice. Declared
+-- here, above login/withAuth/takeFallbackNotice, so every closure below
+-- that reads or writes it closes over this same upvalue.
+local fallback_notice_pending = false
+
 -- F33-D1: the sole place session tokens are read. Session mode requires
 -- every one of: the explicit `auth == "session"` marker, both tokens
 -- present as non-empty strings, and `session_host` equal to the current
@@ -194,6 +199,19 @@ end
 
 function AudiobookshelfApi:isSignedIn()
     return sessionTokens() ~= nil
+end
+
+-- GKC-D3: returns the pending API-token fallback notice exactly once, then
+-- nil. Whichever UI surface asks first after the triggering request shows
+-- it; later requests run in plain token mode and can never set the flag
+-- again, so the notice cannot reappear until another fallback happens.
+-- Never declares `_` as a throwaway loop variable.
+function AudiobookshelfApi:takeFallbackNotice()
+    if not fallback_notice_pending then
+        return nil
+    end
+    fallback_notice_pending = false
+    return _("Your sign-in expired. Using your API token instead.")
 end
 
 -- Best-effort only: the server revoke this bounds (AudiobookshelfApi:signOut)
@@ -418,15 +436,21 @@ function AudiobookshelfApi:login(username, password)
     -- Written LAST: an interrupted write sequence then never leaves the
     -- session marker set over incomplete tokens.
     Settings:write("auth", "session")
+    -- GKC-D3: a fresh sign-in makes any still-pending fallback notice
+    -- untrue -- clear it even if it was never shown.
+    fallback_notice_pending = false
     return true
 end
 
 -- F33-D6: the shared refresh path. Returns the new access token on
 -- success, or nil plus a reason exactly like every other API method. Never
--- calls withAuth -- there is no loop here to close. Records its own
--- ErrorLog entries (F33-D7): a refresh failure is an account-level event,
--- worth surfacing under this method's own name regardless of which request
--- triggered it.
+-- calls withAuth -- there is no loop here to close. Still records its own
+-- ErrorLog entries for every failure except the 401/403 expiry (F33-D7): a
+-- refresh failure is an account-level event, worth surfacing under this
+-- method's own name regardless of which request triggered it. GKC-D6: the
+-- 401/403 expiry is the one exception -- withAuth records that single
+-- Recent-errors line itself, once it knows whether an API-token fallback
+-- follows, so one expiry event never yields two lines.
 local function refreshSession(server)
     local _access, refresh = sessionTokens()
     if not isNonEmptyString(refresh) then
@@ -450,7 +474,9 @@ local function refreshSession(server)
     if code == 401 or code == 403 then
         clearSession()
         logger.warn("AudiobookshelfApi: refreshSession: session expired, signed out")
-        ErrorLog:record("refreshSession: session expired, sign in again")
+        -- GKC-D6: no ErrorLog record here -- withAuth records the event's
+        -- single Recent-errors line once it knows whether a stored API
+        -- token is available to fall back to.
         return nil, "session_expired"
     end
     if code ~= 200 or response == "" then
@@ -494,28 +520,73 @@ local function sendTable(server, token, path, block_timeout, total_timeout, prep
     return { ok = ok, code = code, headers = headers, status = status, body = body }
 end
 
--- F33-D6: at most one refresh and one retry per request, no matter how the
--- retry itself turns out -- a 401 on the retry goes through the caller's
--- normal status handling, never back through here.
+-- F33-D6/GKC-D1: at most one refresh, followed by at most one retry, with
+-- either the renewed access token or, when a session-mode refresh itself
+-- comes back 401/403, the stored API token (GKC-D1). No retry result is
+-- ever re-examined -- a 401 on either retry goes through the caller's
+-- normal status handling, never back through here. GKC-D6: withAuth
+-- records the single Recent-errors line for a session-expiry event itself,
+-- once it knows whether a fallback follows; refreshSession still records
+-- every other failure of its own (connection, redirect, server,
+-- unreadable, F33-D7).
 local function withAuth(attempt)
     local server, bearer, mode = credentials()
     if not server then
         return nil, "unconfigured"
     end
     local outcome = attempt(server, bearer)
-    if mode == "session" and outcome.code == 401 then
-        local new_access, reason, detail = refreshSession(server)
-        if not new_access then
-            return nil, reason, detail
-        end
-        return attempt(server, new_access)
+    if not (mode == "session" and outcome.code == 401) then
+        outcome.auth_mode = mode
+        return outcome
     end
-    return outcome
+    local new_access, reason, detail = refreshSession(server)
+    if new_access then
+        local retry = attempt(server, new_access)
+        retry.auth_mode = "session"
+        return retry
+    end
+    if reason ~= "session_expired" then
+        -- Connection, redirect, server, or unreadable: the session is kept
+        -- and refreshSession already recorded its own entry (F33-D7).
+        return nil, reason, detail
+    end
+    -- GKC-D1: the fallback is bound to this one narrow case -- a
+    -- session-mode 401 whose own refresh came back 401/403. Every other
+    -- path above has already returned.
+    local token = Settings:read("token")
+    if not isNonEmptyString(token) then
+        -- No API token to fall back to: report the expiry exactly as
+        -- before, with the same text refreshSession used to record itself.
+        ErrorLog:record("refreshSession: session expired, sign in again")
+        return nil, "session_expired"
+    end
+    logger.warn("AudiobookshelfApi: sign-in expired, retrying once with the stored API token")
+    local token_retry = attempt(server, token)
+    if token_retry.code == 401 then
+        logger.warn("AudiobookshelfApi: API token rejected after the sign-in expired:",
+            token_retry.status or token_retry.code)
+        -- GKC-D2/GKC-D6: this one line replaces both the fallback line and
+        -- the plain expiry line, because either alone would be untrue.
+        ErrorLog:record("Sign-in expired and the API token was rejected (401)")
+        return nil, "token_rejected"
+    end
+    -- GKC-D3/GKC-D6: the fallback succeeded (or failed for some other,
+    -- unrelated reason the retry's own status handling will report) --
+    -- either way the account-level fact is that the sign-in expired and
+    -- the plugin is now on the API token, so it is recorded and surfaced
+    -- once here.
+    ErrorLog:record("Sign-in expired; now using the API token")
+    fallback_notice_pending = true
+    token_retry.auth_mode = "token"
+    token_retry.fell_back = true
+    return token_retry
 end
 
 -- "unconfigured" routes through the shared unconfigured() exit (logging
--- plus the browser's Settings redirect); every other reason has already
--- been logged by refreshSession (F33-D7), so it passes straight through.
+-- plus the browser's Settings redirect). "session_expired" and
+-- "token_rejected" pass straight through too -- both were already recorded
+-- by withAuth (GKC-D6). Every other reason was already logged by
+-- refreshSession (F33-D7).
 local function authFailed(method_name, reason)
     if reason == "unconfigured" then
         return unconfigured(method_name)
@@ -774,6 +845,9 @@ end
 --   unconfigured    -- neither a session nor an API token is usable;
 --   session_expired -- AUTH-03: the session could not be renewed (401/403
 --                      on /auth/refresh); the session has been cleared;
+--   token_rejected  -- GKC-D2: the session could not be renewed and the
+--                      stored API token was rejected on the retry too; the
+--                      session has been cleared;
 --   open_failed     -- the staging file could not be opened for writing;
 --   connection      -- a transport failure (detail is the LuaSocket error
 --                      string, e.g. "timeout") -- on either the download
@@ -831,10 +905,11 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
         pcall(function() outfile:close() end)
         if isConnectionFailure(ok, code) or code ~= 200 then
             -- Every non-200 outcome discards the staging file here, before
-            -- withAuth ever gets to decide whether to refresh -- so a 401's
-            -- partial bytes are gone before the refresh request is even
-            -- built (AUTH-06). The pre-existing destination, if any, is
-            -- never touched by this branch (A-07).
+            -- withAuth ever gets to decide whether to refresh or retry with
+            -- the API token -- so a 401's partial bytes are gone before the
+            -- refresh request, and before any API-token retry, is ever
+            -- built (AUTH-06, GKC-D1). The pre-existing destination, if
+            -- any, is never touched by this branch (A-07).
             DownloadStaging.discard(temp_path)
         end
         return { ok = ok, code = code, headers = headers, status = status }
@@ -846,9 +921,10 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
             unconfigured("downloadFile")
             return false, "unconfigured"
         end
-        -- Every other reason (session_expired, connection, redirect,
-        -- server, unreadable) came from refreshSession, which has already
-        -- logged and recorded it itself (F33-D7).
+        -- session_expired and token_rejected were already recorded by
+        -- withAuth itself (GKC-D6); every other reason (connection,
+        -- redirect, server, unreadable) came from refreshSession, which
+        -- has already logged and recorded it itself (F33-D7).
         return false, reason, detail
     end
     if outcome.open_failed then
@@ -924,8 +1000,9 @@ function AudiobookshelfApi:getLibraryItemCover(id)
     -- A cover that cannot be fetched -- whatever the reason, a transport
     -- failure, a redirect, a 404, an unrenewable session, or any other
     -- status -- must never surface in Settings -> Recent errors, which is
-    -- a user-facing buffer. (refreshSession still records its own F33-D7
-    -- entry on a genuine session failure; this method adds nothing more.)
+    -- a user-facing buffer. (withAuth records the session-expiry/
+    -- token-rejection line itself, GKC-D6; refreshSession still records
+    -- its other failures, F33-D7; this method adds nothing more.)
     if not outcome then
         logger.warn("AudiobookshelfApi: getLibraryItemCover could not renew the session:", id, reason)
         return nil, reason
@@ -979,8 +1056,9 @@ function AudiobookshelfApi:downloadCover(id, local_path)
     local outcome, reason = withAuth(attempt)
     -- OD-2: a missing/failed cover must never surface in Settings -> Recent
     -- errors, which is a user-facing buffer -- whatever the reason,
-    -- including an unrenewable session (refreshSession still records its
-    -- own F33-D7 entry on a genuine session failure; nothing more is added
+    -- including an unrenewable session (withAuth records the
+    -- session-expiry/token-rejection line itself, GKC-D6; refreshSession
+    -- still records its other failures, F33-D7; nothing more is added
     -- here).
     if not outcome then
         logger.warn("AudiobookshelfApi: cannot download cover, session unusable:", id, reason)
@@ -1064,6 +1142,10 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
     return nil, "server"
 end
 
+-- GKC-D5: on success, returns true, auth_mode, fell_back -- auth_mode is
+-- "session" or "token" (the method that actually answered), and fell_back
+-- is true only when this very call triggered the API-token fallback.
+-- Failure keeps the existing false, message contract.
 function AudiobookshelfApi:testConnection()
     -- CR-F4: normalized before the empty check, so a stored value of only
     -- slashes reads as not set rather than as a URL to dial. Kept verbatim.
@@ -1088,9 +1170,13 @@ function AudiobookshelfApi:testConnection()
     if not outcome then
         local message
         if reason == "session_expired" then
-            -- refreshSession already recorded this itself (F33-D7); do not
+            -- withAuth already recorded this itself (GKC-D6); do not
             -- record it again here.
             message = _("Your sign-in has expired. Sign in again.")
+        elseif reason == "token_rejected" then
+            -- GKC-D2/GKC-D6: withAuth already recorded the combined
+            -- rejection line; nothing more to add here.
+            message = _("Invalid or expired API token")
         elseif reason == "connection" then
             message = T(_("Could not reach the server (%1). Check the server URL and your Wi-Fi connection."),
                 tostring(detail))
@@ -1110,7 +1196,9 @@ function AudiobookshelfApi:testConnection()
             tostring(outcome.code))
     end
     if outcome.code == 200 then
-        return true, nil
+        -- GKC-D5: names the method that answered, and whether this call
+        -- itself triggered the fallback.
+        return true, outcome.auth_mode, outcome.fell_back == true
     end
     if isRedirect(outcome.code) then
         -- The one place a redirect gets a full sentence: this is the check a
@@ -1123,8 +1211,10 @@ function AudiobookshelfApi:testConnection()
     if outcome.code == 401 then
         -- AUTH-05: a 401 here already survived withAuth's one refresh
         -- attempt (session mode) or never had a session to refresh (token
-        -- mode), so this is a genuine rejection either way.
-        local message = (mode == "session")
+        -- mode), so this is a genuine rejection either way. GKC-D5: read
+        -- the outcome's own auth_mode, not the pre-call mode -- a fallback
+        -- can change session to token mid-call.
+        local message = (outcome.auth_mode == "session")
             and _("The server rejected your sign-in. Sign in again.")
             or _("Invalid or expired API token")
         logger.warn("AudiobookshelfApi: testConnection unauthorized:", outcome.status or outcome.code)

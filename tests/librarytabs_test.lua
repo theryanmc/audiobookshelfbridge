@@ -59,6 +59,8 @@ function Api:getLibraryItemsMetadata(source)
     end
     return result
 end
+-- GKC-D4: the browser now calls this after every request.
+function Api:takeFallbackNotice() return nil end
 package.loaded["audiobookshelfbridge/api"] = Api
 for _, name in ipairs({ "bookdetailswidget", "covergrid", "settings", "settingsmenu" }) do
     package.loaded["audiobookshelfbridge/" .. name] = {}

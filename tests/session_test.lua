@@ -385,6 +385,9 @@ local function resetAll()
     infomessage_calls = {}
     confirmbox_calls = {}
     multiinput_calls = {}
+    -- GKC-D3: drain any pending fallback notice so it never leaks between
+    -- scenarios.
+    Api:takeFallbackNotice()
 end
 
 -- 1. serverHost -----------------------------------------------------
@@ -895,7 +898,357 @@ browser:showApiFailure("unconfigured", "fallback")
 assert(#infomessage_calls == 1)
 print("PASS: browser routes session_expired and unconfigured to Settings with a matching message")
 
--- 10. Secret scan -----------------------------------------------------------
+-- 10. API-token fallback (quick-260928-gkc) ---------------------------------
+
+local fallback_texts = {}
+
+local function recordFallbackText(text)
+    if text then
+        table.insert(fallback_texts, text)
+    end
+end
+
+-- Same session setup as signInFreshSession, plus a stored API token to
+-- fall back to.
+local function signInWithToken()
+    signInFreshSession()
+    settings_table.token = "APITOKEN-SECRET"
+end
+
+-- Counts error_log entries equal to `text` -- used to prove a line is
+-- never added twice across scenarios that share the log (GKC-D6).
+local function countLog(text)
+    local count = 0
+    for _, entry in ipairs(error_log) do
+        if entry == text then count = count + 1 end
+    end
+    return count
+end
+
+-- Fallback success (GKC-D1): a session-mode 401 whose refresh is itself
+-- rejected (401), with a token stored, completes on the token.
+for _, refresh_mode in ipairs({ "401", "403" }) do
+    signInWithToken()
+    LIBS_RESPONSES = { { mode = "401" }, { mode = "ok" } }
+    REFRESH_MODE = refresh_mode
+    local before = #error_log
+    local fb_libs = Api:getLibraries()
+    assert(fb_libs and fb_libs[1].id == "lib1", refresh_mode)
+    assert(#libs_requests == 2 and #refresh_requests == 1, refresh_mode .. ": expected exactly 3 HTTP calls")
+    assert(libs_requests[1].headers["Authorization"] == "Bearer ACCESS-ONE", refresh_mode)
+    assert(libs_requests[2].headers["Authorization"] == "Bearer APITOKEN-SECRET", refresh_mode)
+    assert(settings_table.auth == nil and settings_table.access_token == nil
+        and settings_table.refresh_token == nil and settings_table.session_host == nil, refresh_mode)
+    assert(settings_table.token == "APITOKEN-SECRET" and settings_table.username == "alice", refresh_mode)
+    assert(#error_log - before == 1, refresh_mode .. ": exactly one error_log entry per expiry event")
+    assert(error_log[#error_log] == "Sign-in expired; now using the API token", refresh_mode)
+end
+print("PASS: a session-mode 401 whose refresh is rejected (401/403) falls back to the stored API token in exactly 3 HTTP calls")
+-- Baseline for later "never added again" checks: the loop above ran the
+-- fallback twice (401, then 403), so the line legitimately appears twice
+-- already.
+local FALLBACK_LINE = "Sign-in expired; now using the API token"
+local fallback_line_baseline = countLog(FALLBACK_LINE)
+
+-- Notice consumed once (GKC-D3), from the fallback above.
+local fb_notice = Api:takeFallbackNotice()
+assert(fb_notice == "Your sign-in expired. Using your API token instead.")
+recordFallbackText(fb_notice)
+assert(Api:takeFallbackNotice() == nil, "a second call must return nil")
+
+-- After the fallback, the next request runs in plain token mode: one
+-- request, no refresh, no new error_log entries.
+libs_requests, refresh_requests = {}, {}
+LIBS_RESPONSES = { { mode = "ok" } }
+local before_next = #error_log
+local fb_libs2 = Api:getLibraries()
+assert(fb_libs2 and fb_libs2[1].id == "lib1")
+assert(#libs_requests == 1 and #refresh_requests == 0)
+assert(libs_requests[1].headers["Authorization"] == "Bearer APITOKEN-SECRET")
+assert(#error_log - before_next == 0, "a plain token-mode success adds no log entries")
+assert(Api:takeFallbackNotice() == nil, "a follow-up request must never re-set the notice")
+
+-- A later plain 401 (token mode) reports its own reason, and the fallback
+-- line is never added again.
+libs_requests, refresh_requests = {}, {}
+LIBS_RESPONSES = { { mode = "401" } }
+local fb_libs3, fb_libs3_reason = Api:getLibraries()
+assert(fb_libs3 == nil and fb_libs3_reason == "server")
+assert(#libs_requests == 1 and #refresh_requests == 0)
+assert(countLog(FALLBACK_LINE) == fallback_line_baseline,
+    "the fallback line must not be added again on a later plain 401")
+print("PASS: after the fallback, later requests run in plain token mode and the notice is consumed exactly once")
+
+-- A successful sign-in clears a pending notice even if it was never shown.
+signInWithToken()
+LIBS_RESPONSES = { { mode = "401" }, { mode = "ok" } }
+REFRESH_MODE = "401"
+Api:getLibraries()
+LOGIN_MODE = "ok"
+assert(Api:login("alice", "PASSWORD-SECRET"))
+assert(Api:takeFallbackNotice() == nil, "a fresh sign-in must clear a still-pending notice")
+-- That getLibraries() call above was itself a fallback event, so the
+-- baseline used by every later "never added again" check moves up by one.
+fallback_line_baseline = countLog(FALLBACK_LINE)
+print("PASS: a successful sign-in clears a pending fallback notice")
+
+-- Token retry rejected (GKC-D2): the token is bad too.
+signInWithToken()
+LIBS_RESPONSES = { { mode = "401" }, { mode = "401" } }
+REFRESH_MODE = "401"
+libs_requests, refresh_requests = {}, {}
+local before_rejected = #error_log
+local rej_libs, rej_reason = Api:getLibraries()
+assert(rej_libs == nil and rej_reason == "token_rejected", "not session_expired")
+assert(#libs_requests == 2 and #refresh_requests == 1, "exactly 3 HTTP calls")
+assert(settings_table.auth == nil and settings_table.access_token == nil
+    and settings_table.refresh_token == nil and settings_table.session_host == nil)
+assert(settings_table.token == "APITOKEN-SECRET")
+assert(Api:takeFallbackNotice() == nil)
+assert(#error_log - before_rejected == 1)
+assert(error_log[#error_log] == "Sign-in expired and the API token was rejected (401)")
+print("PASS: a rejected token retry reports token_rejected and records the combined rejection line")
+
+-- No token stored: today's session_expired behavior, unchanged.
+for _, refresh_mode in ipairs({ "401", "403" }) do
+    signInFreshSession()
+    LIBS_RESPONSES = { { mode = "401" } }
+    REFRESH_MODE = refresh_mode
+    local before_notoken = #error_log
+    local nt_libs, nt_reason = Api:getLibraries()
+    assert(nt_libs == nil and nt_reason == "session_expired", refresh_mode)
+    assert(#libs_requests == 1 and #refresh_requests == 1, refresh_mode)
+    assert(Api:takeFallbackNotice() == nil, refresh_mode)
+    assert(#error_log - before_notoken == 1, refresh_mode)
+    assert(error_log[#error_log] == "refreshSession: session expired, sign in again", refresh_mode)
+end
+REFRESH_MODE = "ok"
+print("PASS: with no API token stored, refresh 401/403 still reports session_expired with the unchanged Recent-errors line")
+
+-- A flaky refresh (connection/server) with a token stored never falls
+-- back -- the session is kept and the fallback line is not added again.
+local NO_FALLBACK_REASONS = { timeout = "connection", ["429"] = "server" }
+for refresh_mode, expected_reason in pairs(NO_FALLBACK_REASONS) do
+    signInWithToken()
+    LIBS_RESPONSES = { { mode = "401" } }
+    REFRESH_MODE = refresh_mode
+    libs_requests, refresh_requests = {}, {}
+    local flaky_result, flaky_reason = Api:getLibraries()
+    assert(flaky_result == nil and flaky_reason == expected_reason, refresh_mode)
+    assert(#libs_requests == 1 and #refresh_requests == 1, refresh_mode)
+    assert(settings_table.auth == "session", refresh_mode .. ": session must be kept")
+    for _, req in ipairs(libs_requests) do
+        assert(req.headers["Authorization"] ~= "Bearer APITOKEN-SECRET", refresh_mode)
+    end
+    assert(Api:takeFallbackNotice() == nil, refresh_mode)
+    assert(countLog(FALLBACK_LINE) == fallback_line_baseline, refresh_mode)
+end
+REFRESH_MODE = "ok"
+print("PASS: a flaky refresh (connection/server) with a token stored keeps the session and never falls back")
+
+-- A successful refresh whose retry then gets 401 never falls back either.
+signInWithToken()
+LIBS_RESPONSES = { { mode = "401" }, { mode = "401" } }
+REFRESH_MODE = "ok"
+libs_requests, refresh_requests = {}, {}
+local retry401_result, retry401_reason = Api:getLibraries()
+assert(retry401_result == nil and retry401_reason == "server")
+assert(#libs_requests == 2 and #refresh_requests == 1)
+for _, req in ipairs(libs_requests) do
+    assert(req.headers["Authorization"] ~= "Bearer APITOKEN-SECRET")
+end
+assert(settings_table.auth == "session")
+print("PASS: a successful refresh whose own retry gets 401 is never followed by an API-token fallback")
+
+-- downloadFile fallback (FALLBACK-03/FALLBACK-04): the staging file is
+-- discarded and empty before the token retry, which then completes.
+signInWithToken()
+DOWNLOAD_MODE = "unauthorized"
+REFRESH_MODE = "401"
+local fb_dl_dest = STAGING_DIR .. "/book-fallback.epub"
+local fb_dl_temp = DownloadStaging.tempPathFor(STAGING_DIR, "item1", "ino1")
+EXPECT_STAGING_GONE = fb_dl_temp
+download_requests = {}
+local FB_DOWNLOAD_SEQUENCE = { "unauthorized", "ok" }
+local original_download_dispatch_fb = downloadResponse
+downloadResponse = function(request)
+    DOWNLOAD_MODE = table.remove(FB_DOWNLOAD_SEQUENCE, 1) or "ok"
+    if request.headers["Authorization"] == "Bearer APITOKEN-SECRET" then
+        local staged = io.open(fb_dl_temp, "rb")
+        assert(staged, "the staging file must exist before the token retry")
+        assert(staged:read("*a") == "", "the staging file must be empty before the token retry")
+        staged:close()
+    end
+    return original_download_dispatch_fb(request)
+end
+local before_dl_fb = #error_log
+local fb_dl_ok, fb_dl_code = Api:downloadFile("item1", "ino1", "book-fallback.epub", STAGING_DIR)
+downloadResponse = original_download_dispatch_fb
+EXPECT_STAGING_GONE = nil
+assert(fb_dl_ok == true and fb_dl_code == 200)
+local fb_committed = io.open(fb_dl_dest, "rb")
+assert(fb_committed, "the destination must exist after a successful token retry")
+assert(fb_committed:read("*a") == "EPUBDATA")
+fb_committed:close()
+assert(not io.open(fb_dl_temp, "r"), "no staging file must remain")
+assert(#download_requests == 2 and #refresh_requests == 1)
+assert(download_requests[2].headers["Authorization"] == "Bearer APITOKEN-SECRET")
+assert(#error_log - before_dl_fb == 1)
+assert(error_log[#error_log] == "Sign-in expired; now using the API token")
+os.remove(fb_dl_dest)
+print("PASS: downloadFile starts the token retry from an empty staging file and commits its transfer")
+
+-- downloadFile rejected token: a pre-existing destination survives
+-- untouched.
+signInWithToken()
+DOWNLOAD_MODE = "unauthorized"
+REFRESH_MODE = "401"
+local fb_dl_dest2 = STAGING_DIR .. "/book-fallback2.epub"
+local fb_dl_pre = io.open(fb_dl_dest2, "w")
+fb_dl_pre:write("ORIGINAL-BYTES")
+fb_dl_pre:close()
+download_requests = {}
+local FB_DOWNLOAD_SEQUENCE_REJ = { "unauthorized", "unauthorized" }
+local original_download_dispatch_rej = downloadResponse
+downloadResponse = function(request)
+    DOWNLOAD_MODE = table.remove(FB_DOWNLOAD_SEQUENCE_REJ, 1) or "unauthorized"
+    return original_download_dispatch_rej(request)
+end
+local before_dl_rej = #error_log
+local rej_dl_ok, rej_dl_reason = Api:downloadFile("item1", "ino1", "book-fallback2.epub", STAGING_DIR)
+downloadResponse = original_download_dispatch_rej
+assert(rej_dl_ok == false and rej_dl_reason == "token_rejected")
+local fb_dl_kept = io.open(fb_dl_dest2, "rb")
+assert(fb_dl_kept:read("*a") == "ORIGINAL-BYTES", "a rejected token retry must never touch a pre-existing destination")
+fb_dl_kept:close()
+local fb_dl_temp2 = DownloadStaging.tempPathFor(STAGING_DIR, "item1", "ino1")
+assert(not io.open(fb_dl_temp2, "r"), "no staging file must remain")
+assert(#error_log - before_dl_rej == 1)
+assert(error_log[#error_log] == "Sign-in expired and the API token was rejected (401)")
+os.remove(fb_dl_dest2)
+print("PASS: downloadFile reports token_rejected and leaves a pre-existing destination untouched")
+
+-- downloadCover fallback: the second (token) request completes the write.
+signInWithToken()
+REFRESH_MODE = "401"
+local fb_cover_path = STAGING_DIR .. "/cover-fallback.webp"
+cover_requests = {}
+local FB_COVER_SEQUENCE = { "unauthorized", "ok" }
+local original_cover_dispatch_fb = coverResponse
+coverResponse = function(request)
+    COVER_MODE = table.remove(FB_COVER_SEQUENCE, 1) or "ok"
+    return original_cover_dispatch_fb(request)
+end
+local before_cov_fb = #error_log
+local fb_cov_ok = Api:downloadCover("item1", fb_cover_path)
+coverResponse = original_cover_dispatch_fb
+assert(fb_cov_ok == true)
+local fb_cov_file = io.open(fb_cover_path, "rb")
+assert(fb_cov_file:read("*a") == "COVERBYTES")
+fb_cov_file:close()
+assert(#cover_requests == 2)
+assert(cover_requests[2].headers["Authorization"] == "Bearer APITOKEN-SECRET")
+assert(#error_log - before_cov_fb == 1)
+assert(error_log[#error_log] == "Sign-in expired; now using the API token")
+os.remove(fb_cover_path)
+print("PASS: downloadCover falls back to the API token and adds no error_log entry of its own")
+
+-- testConnection (GKC-D5): names the method, and reports the fallback.
+signInFreshSession()
+ME_MODE = "ok"
+local tc_session_ok, tc_session_mode, tc_session_fb = Api:testConnection()
+assert(tc_session_ok == true and tc_session_mode == "session" and tc_session_fb == false)
+
+resetAll()
+settings_table.server = "https://books.example.com"
+settings_table.token = "APITOKEN-SECRET"
+ME_MODE = "ok"
+local tc_token_ok, tc_token_mode, tc_token_fb = Api:testConnection()
+assert(tc_token_ok == true and tc_token_mode == "token" and tc_token_fb == false)
+
+signInWithToken()
+local FB_ME_SEQUENCE = { "401", "ok" }
+local original_me_dispatch_fb = meResponse
+meResponse = function(request)
+    ME_MODE = table.remove(FB_ME_SEQUENCE, 1) or "ok"
+    return original_me_dispatch_fb(request)
+end
+REFRESH_MODE = "401"
+me_requests, refresh_requests = {}, {}
+local before_tc_fb = #error_log
+local tc_fb_ok, tc_fb_mode, tc_fb_fell = Api:testConnection()
+meResponse = original_me_dispatch_fb
+assert(tc_fb_ok == true and tc_fb_mode == "token" and tc_fb_fell == true)
+assert(#me_requests == 2 and #refresh_requests == 1)
+assert(settings_table.auth == nil)
+local tc_fb_notice = Api:takeFallbackNotice()
+assert(tc_fb_notice == "Your sign-in expired. Using your API token instead.",
+    "testConnection must not consume the notice itself")
+recordFallbackText(tc_fb_notice)
+assert(#error_log - before_tc_fb == 1)
+assert(error_log[#error_log] == "Sign-in expired; now using the API token")
+
+signInWithToken()
+local FB_ME_SEQUENCE_REJ = { "401", "401" }
+local original_me_dispatch_rej = meResponse
+meResponse = function(request)
+    ME_MODE = table.remove(FB_ME_SEQUENCE_REJ, 1) or "401"
+    return original_me_dispatch_rej(request)
+end
+REFRESH_MODE = "401"
+me_requests, refresh_requests = {}, {}
+local before_tc_rej = #error_log
+local tc_rej_ok, tc_rej_msg = Api:testConnection()
+meResponse = original_me_dispatch_rej
+assert(tc_rej_ok == false and tc_rej_msg == "Invalid or expired API token")
+assert(settings_table.auth == nil)
+assert(Api:takeFallbackNotice() == nil)
+assert(#error_log - before_tc_rej == 1)
+assert(error_log[#error_log] == "Sign-in expired and the API token was rejected (401)")
+recordFallbackText(tc_rej_msg)
+
+signInFreshSession()
+ME_MODE = "401"
+REFRESH_MODE = "401"
+local before_tc_notoken = #error_log
+local tc_notoken_ok, tc_notoken_msg = Api:testConnection()
+assert(tc_notoken_ok == false and tc_notoken_msg:lower():find("sign in", 1, true))
+assert(#error_log - before_tc_notoken == 1)
+assert(error_log[#error_log] == "refreshSession: session expired, sign in again")
+recordFallbackText(tc_notoken_msg)
+REFRESH_MODE = "ok"
+
+resetAll()
+settings_table.server = "https://books.example.com"
+settings_table.token = "APITOKEN-SECRET"
+ME_MODE = "401"
+local tc_tokenonly_ok, tc_tokenonly_msg = Api:testConnection()
+assert(tc_tokenonly_ok == false and tc_tokenonly_msg == "Invalid or expired API token")
+recordFallbackText(tc_tokenonly_msg)
+print("PASS: testConnection names the method that answered and reports a fallback on its own request")
+
+-- Browser (GKC-D4): showFallbackNotice shows the notice once; showApiFailure
+-- routes token_rejected to Settings with an API-token-specific message.
+signInWithToken()
+LIBS_RESPONSES = { { mode = "401" }, { mode = "ok" } }
+REFRESH_MODE = "401"
+Api:getLibraries()
+infomessage_calls = {}
+browser:showFallbackNotice()
+assert(#infomessage_calls == 1)
+recordFallbackText(infomessage_calls[1].text)
+browser:showFallbackNotice()
+assert(#infomessage_calls == 1, "a second call must show nothing new")
+
+infomessage_calls = {}
+browser:showApiFailure("token_rejected", "fallback")
+assert(#infomessage_calls == 1 and infomessage_calls[1].text:find("API token", 1, true))
+recordFallbackText(infomessage_calls[1].text)
+print("PASS: the browser shows the fallback notice exactly once and routes token_rejected to Settings")
+
+REFRESH_MODE = "ok"
+
+-- 11. Secret scan -----------------------------------------------------------
 
 local FORBIDDEN = { "PASSWORD-SECRET", "ACCESS-ONE", "ACCESS-TWO", "REFRESH-ONE", "REFRESH-TWO", "APITOKEN-SECRET" }
 
@@ -922,6 +1275,10 @@ end
 for i, t in ipairs(confirmbox_calls) do
     scanForSecrets(t.text, "confirmbox_calls[" .. i .. "].text")
 end
+-- GKC-D6/T-gkc-01: every message the fallback section collected --
+-- InfoMessage texts, testConnection messages, and takeFallbackNotice
+-- results.
+scanForSecrets(fallback_texts, "fallback_texts")
 -- Settings storage legitimately holds the access/refresh/API tokens; only
 -- the password must never appear there.
 assert(not tostring(settings_table.access_token or ""):find("PASSWORD-SECRET", 1, true))
