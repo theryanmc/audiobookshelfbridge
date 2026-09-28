@@ -316,6 +316,9 @@ function AudiobookshelfBrowser:onMenuSelect(item)
                     self:onCloseAllMenus()
                 end,
             }
+            -- init has already told the user why the load failed; don't
+            -- show an empty widget that would swallow input.
+            if bookdetailswidget.load_failed then return end
             UIManager:show(bookdetailswidget, "flashui")
         end
         NetworkMgr:runWhenOnline(connect_callback)

@@ -59,8 +59,12 @@ function BookDetailsWidget:init()
             text = text,
             timeout = 2,
         })
-        -- close the widget to avoid crashes elsewhere
-        UIManager:close(self)
+        -- Mark the failure instead of closing: the widget is not on the
+        -- UIManager stack yet during init, so closing here is a no-op. The
+        -- caller must check this flag and skip UIManager:show entirely --
+        -- an empty widget left on top of the stack would swallow every tap
+        -- and key.
+        self.load_failed = true
         return
     end
 
