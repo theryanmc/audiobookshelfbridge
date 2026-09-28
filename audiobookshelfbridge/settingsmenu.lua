@@ -1,11 +1,19 @@
 local Settings = require("audiobookshelfbridge/settings")
 local AudiobookshelfApi = require("audiobookshelfbridge/api")
 local ErrorLog = require("audiobookshelfbridge/errorlog")
+local ConfirmBox = require("ui/widget/confirmbox")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
+-- Required here, not in api.lua: tests/transport_test.lua and
+-- tests/api_metadata_test.lua load the real api.lua unstubbed and must
+-- keep doing so; the connectivity check for Sign out (F33-D4) belongs
+-- with the UI that needs it.
+local MultiInputDialog = require("ui/widget/multiinputdialog")
+local NetworkMgr = require("ui/network/manager")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
+local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -37,6 +45,35 @@ function SettingsMenu:getDownloadFolder()
     return download_dir
 end
 
+-- F33: maps a signIn() failure reason/detail to a message naming what
+-- actually went wrong. A module-level function, outside any loop -- this
+-- file never shadows the single-underscore gettext identifier, so every
+-- branch below can call _()/T() directly. "connection", "redirect" and
+-- "unreadable" reuse AudiobookshelfApi:testConnection's / the browser's
+-- exact msgids on purpose, so a translation covering those already covers
+-- these too.
+function SettingsMenu.signInFailureText(reason, detail)
+    if reason == "unconfigured" then
+        return _("Set the server URL before signing in.")
+    elseif reason == "invalid_credentials" then
+        return _("Wrong username or password.")
+    elseif reason == "rate_limited" then
+        return _("Too many sign-in attempts. Wait a few minutes and try again.")
+    elseif reason == "connection" then
+        return T(_("Could not reach the server (%1). Check the server URL and your Wi-Fi connection."),
+            tostring(detail))
+    elseif reason == "redirect" then
+        return _("The server redirected the request instead of answering it. Check the URL (http vs https, extra path), or sign in to the Wi-Fi network first.")
+    elseif reason == "server" then
+        return T(_("Sign-in failed (HTTP %1)."), tostring(detail))
+    elseif reason == "unreadable" then
+        return _("Audiobookshelf sent a response this plugin could not read. See Recent errors in Settings.")
+    elseif reason == "unsupported" then
+        return _("This server did not return a sign-in session and may be too old. Use an API token instead.")
+    end
+    return _("Sign-in failed. Check network and settings, then try again.")
+end
+
 function SettingsMenu:genItemTable()
     local item_table = {}
     table.insert(item_table, {
@@ -44,8 +81,34 @@ function SettingsMenu:genItemTable()
         type = "server",
     })
 
+    -- F33-D2: signing in leaves a stored API token in place -- it stops
+    -- being used, but stays as the fallback after sign-out or expiry.
+    local signed_in = AudiobookshelfApi:isSignedIn()
+    if signed_in then
+        table.insert(item_table, {
+            text = T(_("Signed in as %1"), Settings:read("username", "")),
+            type = "sign_in",
+        })
+        table.insert(item_table, {
+            text = _("Sign out"),
+            type = "sign_out",
+        })
+    else
+        table.insert(item_table, {
+            text = _("Sign in with username and password"),
+            type = "sign_in",
+        })
+    end
+
     local token_value = Settings:read("token", "")
-    local token_state = (token_value ~= "" and _("configured")) or _("not set")
+    local token_state
+    if token_value == "" then
+        token_state = _("not set")
+    elseif signed_in then
+        token_state = _("configured, not used while signed in")
+    else
+        token_state = _("configured")
+    end
     table.insert(item_table, {
         text = T(_("API token: %1"), token_state),
         type = "token",
@@ -96,6 +159,10 @@ end
 function SettingsMenu:onMenuSelect(item)
     if item.type == "server" then
         self:editServer()
+    elseif item.type == "sign_in" then
+        self:signIn()
+    elseif item.type == "sign_out" then
+        self:confirmSignOut()
     elseif item.type == "token" then
         self:editToken()
     elseif item.type == "download_dir" then
@@ -233,6 +300,140 @@ function SettingsMenu:editToken()
     }
     UIManager:show(dialog)
     dialog:onShowKeyboard()
+end
+
+-- AUTH-01/AUTH-02, per F33-D2/F33-D8: a two-field MultiInputDialog
+-- (username pre-filled, password masked and never pre-filled), FocusManager
+-- traversal comes free with that widget. The password is never stored on
+-- self, in Settings, or in any table that outlives the nextTick callback
+-- below.
+function SettingsMenu:signIn()
+    local server = AudiobookshelfApi.normalizeServerUrl(Settings:read("server"))
+    if type(server) ~= "string" or server == "" then
+        UIManager:show(InfoMessage:new{
+            text = SettingsMenu.signInFailureText("unconfigured"),
+            timeout = 2,
+        })
+        return
+    end
+
+    local fields = {
+        {
+            text = Settings:read("username", ""),
+            hint = _("Username"),
+        },
+        {
+            text = "",
+            hint = _("Password"),
+            text_type = "password",
+        },
+    }
+    if server:match("^http://") then
+        -- F33-D8: warn before the password is ever sent.
+        fields[2].description = _("This server uses http://, so your password will be sent unencrypted. Use https:// if possible.")
+    end
+
+    local dialog
+    dialog = MultiInputDialog:new{
+        title = _("Sign in to Audiobookshelf"),
+        fields = fields,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        dialog:onClose()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Sign in"),
+                    callback = function()
+                        local values = dialog:getFields()
+                        local username = (values[1] or ""):match("^%s*(.-)%s*$") or ""
+                        -- Never trim the password: spaces are legal, and an
+                        -- empty password is allowed (some Audiobookshelf
+                        -- accounts have none).
+                        local password = values[2] or ""
+                        if username == "" then
+                            UIManager:show(InfoMessage:new{
+                                text = _("Enter your username."),
+                                timeout = 2,
+                            })
+                            return
+                        end
+                        dialog:onClose()
+                        UIManager:close(dialog)
+                        local progress = InfoMessage:new{
+                            text = _("Signing in…"),
+                        }
+                        UIManager:show(progress)
+                        UIManager:nextTick(function()
+                            UIManager:forceRePaint()
+                            local pok, ok, reason, detail = pcall(AudiobookshelfApi.login,
+                                AudiobookshelfApi, username, password)
+                            UIManager:close(progress)
+                            if pok and ok then
+                                self:refresh()
+                                if server:match("^http://") then
+                                    UIManager:show(InfoMessage:new{
+                                        text = _("Signed in. This address uses http://, so your session is sent unencrypted on every request. Use https:// if your server supports it."),
+                                        timeout = 6,
+                                    })
+                                else
+                                    UIManager:show(InfoMessage:new{
+                                        text = T(_("Signed in as %1"), username),
+                                        timeout = 2,
+                                    })
+                                end
+                            else
+                                if not pok then
+                                    logger.warn("SettingsMenu: sign-in raised:", ok)
+                                    reason, detail = nil, nil
+                                end
+                                UIManager:show(InfoMessage:new{
+                                    text = SettingsMenu.signInFailureText(reason, detail),
+                                })
+                            end
+                        end)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+-- F33-D4: local clear first (always shown as success), then a best-effort
+-- server revoke only when the reader is actually connected -- gated on
+-- NetworkMgr:isConnected(), which never prompts to turn Wi-Fi on and does
+-- no DNS lookup. Scheduled after the result message is already shown and
+-- painted, so the user is never left waiting on it.
+function SettingsMenu:confirmSignOut()
+    UIManager:show(ConfirmBox:new{
+        text = _("Sign out of Audiobookshelf?"),
+        ok_text = _("Sign out"),
+        ok_callback = function()
+            local revoke = AudiobookshelfApi:signOut()
+            self:refresh()
+            local has_token = Settings:read("token", "") ~= ""
+            UIManager:show(InfoMessage:new{
+                text = has_token and _("Signed out. The API token will be used from now on.") or _("Signed out"),
+                timeout = 2,
+            })
+            if revoke then
+                local check_ok, connected = pcall(NetworkMgr.isConnected, NetworkMgr)
+                if check_ok and connected then
+                    UIManager:nextTick(function()
+                        UIManager:forceRePaint()
+                        pcall(revoke)
+                    end)
+                end
+            end
+        end,
+    })
 end
 
 function SettingsMenu:chooseDownloadFolder()

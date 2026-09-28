@@ -297,7 +297,20 @@ function AudiobookshelfBrowser:showApiFailure(reason, fallback_text)
         UIManager:nextTick(function()
             UIManager:show(SettingsMenu:new{})
             UIManager:show(InfoMessage:new{
-                text = _("Set your server URL and API token to get started."),
+                text = _("Set your server URL, then sign in or add an API token to get started."),
+                timeout = 3,
+            })
+        end)
+        return
+    end
+    if reason == "session_expired" then
+        -- F33-D9: mirrors the unconfigured branch above -- an expired
+        -- session is an account-level event, not a network failure, so it
+        -- routes to Settings the same way.
+        UIManager:nextTick(function()
+            UIManager:show(SettingsMenu:new{})
+            UIManager:show(InfoMessage:new{
+                text = _("Your sign-in has expired. Choose Sign in to continue."),
                 timeout = 3,
             })
         end)

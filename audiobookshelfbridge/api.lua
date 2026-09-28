@@ -81,25 +81,126 @@ local function normalizeServerUrl(server)
 end
 AudiobookshelfApi.normalizeServerUrl = normalizeServerUrl
 
+local function isNonEmptyString(value)
+    return type(value) == "string" and value ~= ""
+end
+
+-- F33-D5: mirrors common/socket/url.lua's _M.parse (the parser
+-- socket.http actually uses to pick the host it dials), in the same order:
+-- scheme, then the "//" authority, then userinfo removed up to the FIRST
+-- "@", then a trailing port (including an empty one) stripped, then an
+-- IPv6 literal unwrapped. Deliberately not a "smarter" URL parser -- one
+-- that disagreed with LuaSocket's own here would let a session be bound to
+-- a host the connection never actually reaches. Returns the lowercased
+-- host, or nil for anything without a scheme, a "//" authority, or a
+-- non-empty host.
+local function serverHost(url)
+    if type(url) ~= "string" then
+        return nil
+    end
+    local rest = url:match("^[%w][%w%+%-%.]*%:(.*)$")
+    if not rest then
+        return nil
+    end
+    local authority = rest:match("^//([^/%?#]*)")
+    if not authority then
+        return nil
+    end
+    -- Userinfo removed up to the FIRST "@": the exclusion class can never
+    -- itself match "@", so it stops at the first one no matter how many
+    -- follow.
+    local host = authority:match("^[^@]*@(.*)$") or authority
+    -- A trailing port, including an empty one, is stripped here -- before
+    -- the IPv6 unwrap below, so a bracketed literal's own colons are never
+    -- mistaken for a port separator.
+    host = host:gsub(":[^:%]]*$", "")
+    host = host:match("^%[(.+)%]$") or host
+    if host == "" then
+        return nil
+    end
+    return host:lower()
+end
+AudiobookshelfApi.serverHost = serverHost
+
+-- F33-D1/F33-D5: clears every session key, and only session keys -- `token`
+-- and `username` are left alone so a stored API token stays usable as the
+-- fallback and the username can still pre-fill the sign-in dialog. `auth`
+-- is cleared first so a reader that dies mid-write never leaves the
+-- session marker set over an already-cleared token.
+local function clearSession()
+    Settings:write("auth", nil)
+    Settings:write("access_token", nil)
+    Settings:write("refresh_token", nil)
+    Settings:write("session_host", nil)
+end
+
+-- F33-D1: the sole place session tokens are read. Session mode requires
+-- every one of: the explicit `auth == "session"` marker, both tokens
+-- present as non-empty strings, and `session_host` equal to the current
+-- server's host. The explicit marker is what keeps a plain server+token
+-- config -- and tests/api_metadata_test.lua's Settings stub, which answers
+-- every key with "test-token" -- safely in token mode. F33-D5: a host
+-- mismatch (or no host at all) clears the session on this read, before any
+-- request is ever built, so no token can be sent to a different server.
+local function sessionTokens()
+    if Settings:read("auth") ~= "session" then
+        return nil
+    end
+    local access_token = Settings:read("access_token")
+    local refresh_token = Settings:read("refresh_token")
+    if not isNonEmptyString(access_token) or not isNonEmptyString(refresh_token) then
+        return nil
+    end
+    local current_host = serverHost(normalizeServerUrl(Settings:read("server")))
+    local session_host = Settings:read("session_host")
+    if current_host == nil or session_host ~= current_host then
+        clearSession()
+        logger.warn("AudiobookshelfApi: session belongs to a different server host, signed out")
+        return nil
+    end
+    return access_token, refresh_token
+end
+
 -- S1: the single place credentials are read. On a fresh install the config
 -- file does not exist, LuaSettings hands back an empty table, and both reads
 -- return nil. Every request used to concatenate those values outside its
 -- pcall, so the first tap on the plugin raised "attempt to concatenate a nil
 -- value" and took KOReader down -- before the user could ever reach Settings
--- to fix it. Returns nil when either value is missing; callers turn that into
--- an "unconfigured" result the browser routes to Settings.
+-- to fix it. F33-D1: returns server, bearer, mode -- the session access
+-- token when signed in (mode "session"), else the stored API token (mode
+-- "token"), else nil when neither is usable; callers turn a nil into an
+-- "unconfigured" result the browser routes to Settings. Existing two-value
+-- callers keep working unchanged: `bearer` is exactly the value they used
+-- to call `token`.
 local function credentials()
     local server = normalizeServerUrl(Settings:read("server"))
-    local token = Settings:read("token")
-    if type(server) ~= "string" or server == "" or type(token) ~= "string" or token == "" then
+    if not isNonEmptyString(server) then
         return nil
     end
-    return server, token
+    local access_token = sessionTokens()
+    if access_token then
+        return server, access_token, "session"
+    end
+    local token = Settings:read("token")
+    if isNonEmptyString(token) then
+        return server, token, "token"
+    end
+    return nil
 end
 
 function AudiobookshelfApi:isConfigured()
     return credentials() ~= nil
 end
+
+function AudiobookshelfApi:isSignedIn()
+    return sessionTokens() ~= nil
+end
+
+-- Best-effort only: the server revoke this bounds (AudiobookshelfApi:signOut)
+-- runs after the user already has their answer, so it is capped tighter
+-- than the 5s/15s default rather than left open-ended.
+local LOGOUT_BLOCK_TIMEOUT = 3
+local LOGOUT_TOTAL_TIMEOUT = 5
 
 -- S2: `redirect = false`. LuaSocket follows up to five redirects by default,
 -- and its tredirect copies the request headers verbatim to the new location
@@ -197,35 +298,253 @@ function AudiobookshelfApi:decodeResponse(response, method_name, key)
     return result[key]
 end
 
-function AudiobookshelfApi:getLibraries()
-    local server, token = credentials()
-    if not server then
-        return unconfigured("getLibraries")
+-- S2 applied to credentials (T-f33-03): `redirect = false`, and deliberately
+-- NO Authorization header -- neither /login nor /auth/refresh needs or gets
+-- one. A followed redirect here would hand the password or the refresh
+-- token to whoever answered.
+local function buildAuthRequest(server, path, body, sink, extra_headers)
+    local headers = {
+        ["User-Agent"] = USER_AGENT,
+        ["Content-Type"] = "application/json",
+        ["Content-Length"] = tostring(#body),
+    }
+    for key, value in pairs(extra_headers or {}) do
+        headers[key] = value
     end
+    return {
+        url = server .. path,
+        method = "POST",
+        headers = headers,
+        source = ltn12.source.string(body),
+        sink = sink,
+        redirect = false,
+    }
+end
+
+-- F33-D4: local clear first (always succeeds), then a best-effort server
+-- revoke. Verified against server/Auth.js: POST /logout has no auth
+-- middleware at all (no passport, no rate limiter), reads
+-- `x-refresh-token` (falling back to a cookie this plugin never sets),
+-- invalidates only that one refresh token, and replies
+-- `{ redirect_url }` -- a body this plugin never reads. `revoke` is
+-- returned only when a session valid for the CURRENT host was actually
+-- captured; every one of its outcomes, including a raise, is logger-only
+-- and never surfaces as a value the caller could show.
+function AudiobookshelfApi:signOut()
+    local server = normalizeServerUrl(Settings:read("server"))
+    local _access, refresh = sessionTokens()
+    clearSession()
+    if not isNonEmptyString(refresh) or not isNonEmptyString(server) then
+        return nil
+    end
+    return function()
+        local ok, err = pcall(function()
+            socketutil:set_timeout(LOGOUT_BLOCK_TIMEOUT, LOGOUT_TOTAL_TIMEOUT)
+            local sink = {}
+            local request = buildAuthRequest(server, "/logout", "{}", socketutil.table_sink(sink),
+                { ["x-refresh-token"] = refresh })
+            local req_ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
+            socketutil:reset_timeout()
+            if isConnectionFailure(req_ok, code) then
+                logger.warn("AudiobookshelfApi: signOut logout connection failed:", code)
+            elseif isRedirect(code) or code ~= 200 then
+                logger.warn("AudiobookshelfApi: signOut logout unexpected response:", status or code)
+            end
+        end)
+        if not ok then
+            logger.warn("AudiobookshelfApi: signOut logout raised:", err)
+        end
+    end
+end
+
+-- The password lives only in `body` and the request source built from it
+-- here -- never in Settings, logger, ErrorLog, or any on-screen message.
+function AudiobookshelfApi:login(username, password)
+    local server = normalizeServerUrl(Settings:read("server"))
+    local host = serverHost(server)
+    if not host then
+        logger.warn("AudiobookshelfApi: login called before a valid server URL was configured")
+        return false, "unconfigured"
+    end
+    local body = JSON.encode({ username = username, password = password })
     local sink = {}
-    -- socketutil.table_sink decides at construction time whether to enforce
-    -- the total timeout, so set_timeout must run before it is built --
-    -- otherwise it silently degrades to a plain ltn12 table sink.
     socketutil:set_timeout()
-    local request = buildRequest(server, token, "/api/libraries", socketutil.table_sink(sink))
+    local request = buildAuthRequest(server, "/login", body, socketutil.table_sink(sink),
+        { ["x-return-tokens"] = "true" })
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
     if isConnectionFailure(ok, code) then
-        return connectionFailed("getLibraries", code)
+        logger.warn("AudiobookshelfApi: http request failed in login:", code)
+        ErrorLog:record(T("login: connection failed: %1", tostring(code)))
+        return false, "connection", tostring(code)
     end
     if isRedirect(code) then
-        return redirected("getLibraries", code, status)
+        logger.warn("AudiobookshelfApi: server redirected in login:", status or code)
+        ErrorLog:record(T("login: server redirected (%1)", tostring(code)))
+        return false, "redirect"
     end
-    if code == 200 and response ~= "" then
-        local result = self:decodeResponse(response, "getLibraries", "libraries")
+    if code == 401 then
+        logger.warn("AudiobookshelfApi: login rejected:", status or code)
+        ErrorLog:record("login: rejected (401)")
+        return false, "invalid_credentials"
+    end
+    if code == 429 then
+        logger.warn("AudiobookshelfApi: login rate limited:", status or code)
+        ErrorLog:record("login: too many attempts (429)")
+        return false, "rate_limited"
+    end
+    if code ~= 200 or response == "" then
+        logger.warn("AudiobookshelfApi: cannot sign in", status or code)
+        ErrorLog:record(T("login: server error: %1", tostring(status or code)))
+        return false, "server", code
+    end
+    local decoded = self:decodeResponse(response, "login")
+    if not decoded then
+        return false, "unreadable"
+    end
+    local user = decoded.user
+    -- F33-D3: a 200 without both tokens is "unsupported" -- the deprecated
+    -- legacy `user.token` field is never read or stored.
+    if type(user) ~= "table" or not isNonEmptyString(user.accessToken) or not isNonEmptyString(user.refreshToken) then
+        logger.warn("AudiobookshelfApi: login server did not return a session")
+        ErrorLog:record("login: server did not return a session")
+        return false, "unsupported"
+    end
+    Settings:write("refresh_token", user.refreshToken)
+    Settings:write("access_token", user.accessToken)
+    Settings:write("session_host", host)
+    Settings:write("username", username)
+    -- Written LAST: an interrupted write sequence then never leaves the
+    -- session marker set over incomplete tokens.
+    Settings:write("auth", "session")
+    return true
+end
+
+-- F33-D6: the shared refresh path. Returns the new access token on
+-- success, or nil plus a reason exactly like every other API method. Never
+-- calls withAuth -- there is no loop here to close. Records its own
+-- ErrorLog entries (F33-D7): a refresh failure is an account-level event,
+-- worth surfacing under this method's own name regardless of which request
+-- triggered it.
+local function refreshSession(server)
+    local _access, refresh = sessionTokens()
+    if not isNonEmptyString(refresh) then
+        return nil, "session_expired"
+    end
+    local sink = {}
+    socketutil:set_timeout()
+    local request = buildAuthRequest(server, "/auth/refresh", "{}", socketutil.table_sink(sink),
+        { ["x-refresh-token"] = refresh })
+    local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
+    local response = table.concat(sink)
+    socketutil:reset_timeout()
+    if isConnectionFailure(ok, code) then
+        connectionFailed("refreshSession", code)
+        return nil, "connection", tostring(code)
+    end
+    if isRedirect(code) then
+        redirected("refreshSession", code, status)
+        return nil, "redirect"
+    end
+    if code == 401 or code == 403 then
+        clearSession()
+        logger.warn("AudiobookshelfApi: refreshSession: session expired, signed out")
+        ErrorLog:record("refreshSession: session expired, sign in again")
+        return nil, "session_expired"
+    end
+    if code ~= 200 or response == "" then
+        logger.warn("AudiobookshelfApi: refreshSession failed", status or code)
+        ErrorLog:record(T("refreshSession: server error: %1", tostring(status or code)))
+        return nil, "server", code
+    end
+    local decoded = AudiobookshelfApi:decodeResponse(response, "refreshSession")
+    local user = decoded and decoded.user
+    if type(user) ~= "table" or not isNonEmptyString(user.accessToken) or not isNonEmptyString(user.refreshToken) then
+        if decoded then
+            -- decodeResponse already recorded when the decode itself
+            -- failed; this covers only a well-formed reply with the wrong
+            -- shape.
+            logger.warn("AudiobookshelfApi: refreshSession missing expected field")
+            ErrorLog:record("refreshSession: missing expected field")
+        end
+        return nil, "unreadable"
+    end
+    -- The refresh token rotates on every refresh: persist it, then the
+    -- access token, immediately -- before the retry that triggered this
+    -- call is ever attempted.
+    Settings:write("refresh_token", user.refreshToken)
+    Settings:write("access_token", user.accessToken)
+    return user.accessToken
+end
+
+-- Runs one GET/POST attempt with a table sink at the given timeouts and
+-- returns a plain record every withAuth caller can classify and, on a
+-- retry, reuse unchanged.
+local function sendTable(server, token, path, block_timeout, total_timeout, prepare)
+    socketutil:set_timeout(block_timeout, total_timeout)
+    local sink = {}
+    local request = buildRequest(server, token, path, socketutil.table_sink(sink))
+    if prepare then
+        prepare(request)
+    end
+    local ok, code, headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
+    local body = table.concat(sink)
+    socketutil:reset_timeout()
+    return { ok = ok, code = code, headers = headers, status = status, body = body }
+end
+
+-- F33-D6: at most one refresh and one retry per request, no matter how the
+-- retry itself turns out -- a 401 on the retry goes through the caller's
+-- normal status handling, never back through here.
+local function withAuth(attempt)
+    local server, bearer, mode = credentials()
+    if not server then
+        return nil, "unconfigured"
+    end
+    local outcome = attempt(server, bearer)
+    if mode == "session" and outcome.code == 401 then
+        local new_access, reason, detail = refreshSession(server)
+        if not new_access then
+            return nil, reason, detail
+        end
+        return attempt(server, new_access)
+    end
+    return outcome
+end
+
+-- "unconfigured" routes through the shared unconfigured() exit (logging
+-- plus the browser's Settings redirect); every other reason has already
+-- been logged by refreshSession (F33-D7), so it passes straight through.
+local function authFailed(method_name, reason)
+    if reason == "unconfigured" then
+        return unconfigured(method_name)
+    end
+    return nil, reason
+end
+
+function AudiobookshelfApi:getLibraries()
+    local outcome, reason = withAuth(function(server, token)
+        return sendTable(server, token, "/api/libraries")
+    end)
+    if not outcome then
+        return authFailed("getLibraries", reason)
+    end
+    if isConnectionFailure(outcome.ok, outcome.code) then
+        return connectionFailed("getLibraries", outcome.code)
+    end
+    if isRedirect(outcome.code) then
+        return redirected("getLibraries", outcome.code, outcome.status)
+    end
+    if outcome.code == 200 and outcome.body ~= "" then
+        local result = self:decodeResponse(outcome.body, "getLibraries", "libraries")
         if not result then
             return nil, "unreadable"
         end
         return result
     end
-    logger.warn("AudiobookshelfApi: cannot get libraries", status or code)
-    ErrorLog:record(T("getLibraries: server error: %1", tostring(status or code)))
+    logger.warn("AudiobookshelfApi: cannot get libraries", outcome.status or outcome.code)
+    ErrorLog:record(T("getLibraries: server error: %1", tostring(outcome.status or outcome.code)))
     return nil, "server"
 end
 
