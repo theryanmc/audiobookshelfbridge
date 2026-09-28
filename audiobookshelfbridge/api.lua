@@ -65,6 +65,22 @@ local AudiobookshelfApi = {}
 
 local USER_AGENT = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, "."))
 
+-- CR-F4: a trailing slash on the stored server URL produced request paths
+-- like "https://host//api/..." -- concatenation never inserted a slash of
+-- its own, so a second one from the stored value survived into every
+-- request. Stripping every trailing slash here, and routing every read of
+-- the setting through it (credentials() and testConnection() below), fixes
+-- existing configs on read without ever rewriting the file; editServer also
+-- normalizes on save, so newly-entered URLs are stored clean too. Returns
+-- non-string input unchanged so nil keeps meaning "not configured".
+local function normalizeServerUrl(server)
+    if type(server) ~= "string" then
+        return server
+    end
+    return (server:gsub("/+$", ""))
+end
+AudiobookshelfApi.normalizeServerUrl = normalizeServerUrl
+
 -- S1: the single place credentials are read. On a fresh install the config
 -- file does not exist, LuaSettings hands back an empty table, and both reads
 -- return nil. Every request used to concatenate those values outside its
@@ -73,7 +89,7 @@ local USER_AGENT = T("audiobookshelfbridge.koplugin/%1", table.concat(VERSION, "
 -- to fix it. Returns nil when either value is missing; callers turn that into
 -- an "unconfigured" result the browser routes to Settings.
 local function credentials()
-    local server = Settings:read("server")
+    local server = normalizeServerUrl(Settings:read("server"))
     local token = Settings:read("token")
     if type(server) ~= "string" or server == "" or type(token) ~= "string" or token == "" then
         return nil
@@ -110,6 +126,28 @@ end
 
 local function isRedirect(code)
     return type(code) == "number" and code >= 300 and code < 400
+end
+
+-- CR-L1: `socket.http.request` is `socket.protect`'d (common/socket/http.lua)
+-- -- a transport failure (a closed connection, a DNS failure, the block or
+-- total timeout expiring) never raises through that wrapper. It comes back
+-- as ok == true with a string in `code` (e.g. "timeout", "connection
+-- refused", "sink timeout"), and headers/status both nil. Every call site
+-- below still wraps the request in its own pcall too, so a caught raise
+-- (not ok) is a real bug, not a transport contract -- and is folded into
+-- this same branch rather than left to fall through to the status checks,
+-- where a non-numeric code compared against 200 or a redirect range would
+-- always be false and silently swallow the failure.
+local function isConnectionFailure(ok, code)
+    return not ok or type(code) ~= "number"
+end
+
+-- Only method_name and the LuaSocket error string ever reach ErrorLog here
+-- (D-J/T-e82-03): never the request table, the token, the URL, or a body.
+local function connectionFailed(method_name, err)
+    logger.warn("AudiobookshelfApi: http request failed in " .. method_name .. ":", err)
+    ErrorLog:record(T("%1: connection failed: %2", method_name, tostring(err)))
+    return nil, "connection"
 end
 
 -- The no-credentials and redirect exits, shared by every method below so the
@@ -173,10 +211,8 @@ function AudiobookshelfApi:getLibraries()
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
-    if not ok then
-        logger.warn("AudiobookshelfApi: http request failed in getLibraries:", code)
-        ErrorLog:record(T("getLibraries: connection failed: %1", tostring(code)))
-        return nil, "connection"
+    if isConnectionFailure(ok, code) then
+        return connectionFailed("getLibraries", code)
     end
     if isRedirect(code) then
         return redirected("getLibraries", code, status)
@@ -221,10 +257,8 @@ local function fetchAllPages(self, server, token, base_path, method_name)
         local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
         local response = table.concat(sink)
         socketutil:reset_timeout()
-        if not ok then
-            logger.warn("AudiobookshelfApi: http request failed in " .. method_name .. ":", code)
-            ErrorLog:record(T("%1: connection failed: %2", method_name, tostring(code)))
-            return nil, "connection"
+        if isConnectionFailure(ok, code) then
+            return connectionFailed(method_name, code)
         end
         if isRedirect(code) then
             return redirected(method_name, code, status)
@@ -323,10 +357,8 @@ function AudiobookshelfApi:getAuthorItems(author_id)
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
-    if not ok then
-        logger.warn("AudiobookshelfApi: http request failed in getAuthorItems:", code)
-        ErrorLog:record(T("getAuthorItems: connection failed: %1", tostring(code)))
-        return nil, "connection"
+    if isConnectionFailure(ok, code) then
+        return connectionFailed("getAuthorItems", code)
     end
     if isRedirect(code) then
         return redirected("getAuthorItems", code, status)
@@ -369,9 +401,8 @@ function AudiobookshelfApi:getLibraryItemsMetadata(items)
         request.source = ltn12.source.string(body)
         local ok, code = pcall(function() return socket.skip(1, http.request(request)) end)
         socketutil:reset_timeout()
-        if not ok then
-            ErrorLog:record("getLibraryItemsMetadata: connection failed")
-            return nil, "connection"
+        if isConnectionFailure(ok, code) then
+            return connectionFailed("getLibraryItemsMetadata", code)
         end
         if isRedirect(code) then return redirected("getLibraryItemsMetadata", code) end
         if code ~= 200 then
@@ -413,10 +444,8 @@ function AudiobookshelfApi:getLibraryItem(id)
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
-    if not ok then
-        logger.warn("AudiobookshelfApi: http request failed in getLibraryItem:", code)
-        ErrorLog:record(T("getLibraryItem: connection failed: %1", tostring(code)))
-        return nil, "connection"
+    if isConnectionFailure(ok, code) then
+        return connectionFailed("getLibraryItem", code)
     end
     if isRedirect(code) then
         return redirected("getLibraryItem", code, status)
@@ -433,6 +462,19 @@ function AudiobookshelfApi:getLibraryItem(id)
     return nil, "server"
 end
 
+-- CR-F5: the full return contract, so a caller can name the true failure
+-- instead of a single generic message. true, code on success; otherwise
+-- false, reason[, detail], where reason is one of:
+--   unconfigured  -- server/token not set;
+--   open_failed   -- the staging file could not be opened for writing;
+--   connection    -- a transport failure (detail is the LuaSocket error
+--                    string, e.g. "timeout");
+--   redirect      -- the server answered with a 3xx;
+--   server        -- any other non-200 status (detail is the numeric
+--                    status);
+--   incomplete    -- the transfer did not measure as complete;
+--   commit_failed -- the completed staging file could not replace the
+--                    destination.
 function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
     -- Before the staging file is opened, so an unconfigured plugin leaves
     -- nothing behind on disk.
@@ -478,7 +520,7 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
         socketutil.file_sink(outfile))
     local ok, code, headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
-    if not ok or code ~= 200 then
+    if isConnectionFailure(ok, code) or code ~= 200 then
         -- With the uncapped total set above, socketutil.file_sink is the
         -- plain ltn12 file sink. That sink closes the handle only on a
         -- clean end-of-stream; a transfer that errors or stalls (LuaSocket
@@ -488,16 +530,24 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
         -- guarantee holds. Close inside its own pcall -- the handle may
         -- already be invalid -- then discard the staging file, and only
         -- the staging file. The pre-existing destination, if any, is never
-        -- touched by this branch (A-07).
+        -- touched by this branch (A-07). This covers a transport failure
+        -- too (T-e82-02): CR-L1's classification runs before the redirect
+        -- and status checks below, so a caught raise or a non-numeric code
+        -- takes this same close-and-discard path rather than falling
+        -- through to a status comparison that a string code can never match.
         pcall(function() outfile:close() end)
         DownloadStaging.discard(temp_path)
-        if ok and isRedirect(code) then
+        if isConnectionFailure(ok, code) then
+            connectionFailed("downloadFile", code)
+            return false, "connection", tostring(code)
+        end
+        if isRedirect(code) then
             redirected("downloadFile", code, status)
             return false, "redirect"
         end
         logger.warn("AudiobookshelfApi: cannot download file:", id , ino, status or code)
         ErrorLog:record(T("downloadFile: transfer failed: %1", tostring(status or code)))
-        return false, ok and tostring(status or code) or tostring(code)
+        return false, "server", code
     end
     -- Belt-and-braces close on the success path too. The sink already
     -- closed the handle on its own clean end-of-stream signal, so this
@@ -561,14 +611,15 @@ function AudiobookshelfApi:getLibraryItemCover(id)
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
-    if not ok then
+    -- CR-F7/OD-2: logger only in every branch below, all the way through.
+    -- A cover that cannot be fetched -- whatever the reason, a transport
+    -- failure, a redirect, a 404, or any other status -- must never
+    -- surface in Settings -> Recent errors, which is a user-facing buffer.
+    if isConnectionFailure(ok, code) then
         logger.warn("AudiobookshelfApi: http request failed in getLibraryItemCover:", code)
-        ErrorLog:record(T("getLibraryItemCover: connection failed: %1", tostring(code)))
-        return nil
+        return nil, code
     end
     if isRedirect(code) then
-        -- logger only, no ErrorLog (OD-2): a cover that cannot be fetched
-        -- must never surface in Settings -> Recent errors.
         logger.warn("AudiobookshelfApi: server redirected in getLibraryItemCover:", status or code)
         return nil
     end
@@ -577,7 +628,6 @@ function AudiobookshelfApi:getLibraryItemCover(id)
         return result
     end
     logger.warn("AudiobookshelfApi: cannot get library item cover", id ,status or code)
-    ErrorLog:record(T("getLibraryItemCover: server error: %1", tostring(status or code)))
     -- Second value is the numeric HTTP status, so CoverCache can tell a
     -- definite 404 (D-02) from every other failure mode.
     return nil, code
@@ -612,13 +662,20 @@ function AudiobookshelfApi:downloadCover(id, local_path)
         socketutil.file_sink(outfile))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
-    if not ok or code ~= 200 then
+    if isConnectionFailure(ok, code) or code ~= 200 then
         -- Same close+remove cleanup as downloadFile, for the same reason:
         -- the sink only closes the handle on a clean end-of-stream or its
         -- own sink timeout.
         pcall(function() outfile:close() end)
         os.remove(local_path)
-        logger.warn("AudiobookshelfApi: cannot download cover:", id, ok and (status or code) or "error")
+        -- isConnectionFailure only picks the logger wording here (OD-2:
+        -- still no ErrorLog either way) -- a caught raise or a non-numeric
+        -- code is a transport failure, not an HTTP status.
+        if isConnectionFailure(ok, code) then
+            logger.warn("AudiobookshelfApi: cannot download cover, connection failed:", id, code)
+        else
+            logger.warn("AudiobookshelfApi: cannot download cover:", id, status or code)
+        end
         -- Second value is the numeric HTTP status when the server answered,
         -- or a transport error string otherwise ("sink timeout", "timeout",
         -- or the caught error) -- CoverCache uses this to tell a definite
@@ -651,10 +708,8 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
-    if not ok then
-        logger.warn("AudiobookshelfApi: http request failed in getSearchResults:", code)
-        ErrorLog:record(T("getSearchResults: connection failed: %1", tostring(code)))
-        return nil, "connection"
+    if isConnectionFailure(ok, code) then
+        return connectionFailed("getSearchResults", code)
     end
     if isRedirect(code) then
         return redirected("getSearchResults", code, status)
@@ -689,7 +744,9 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
 end
 
 function AudiobookshelfApi:testConnection()
-    local server = Settings:read("server")
+    -- CR-F4: normalized before the empty check, so a stored value of only
+    -- slashes reads as not set rather than as a URL to dial.
+    local server = normalizeServerUrl(Settings:read("server"))
     local token = Settings:read("token")
     if not server or server == "" then
         local message = _("Server URL is not set")
@@ -708,11 +765,10 @@ function AudiobookshelfApi:testConnection()
     local request = buildRequest(server, token, "/api/me", socketutil.table_sink(sink))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
-    if not ok then
-        logger.warn("AudiobookshelfApi: http request failed in testConnection:", code)
-        local message = tostring(code)
-        ErrorLog:record(T("testConnection: connection failed: %1", message))
-        return false, message
+    if isConnectionFailure(ok, code) then
+        connectionFailed("testConnection", code)
+        return false, T(_("Could not reach the server (%1). Check the server URL and your Wi-Fi connection."),
+            tostring(code))
     end
     if code == 200 then
         return true, nil

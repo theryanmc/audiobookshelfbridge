@@ -40,6 +40,35 @@ local EbookFileWidget = InputContainer:extend{
     onClose = nil -- function to close whole parent menu path after download
 }
 
+-- CR-F5: maps a downloadFile failure reason/detail (see AudiobookshelfApi:
+-- downloadFile's return contract) to a message naming what actually went
+-- wrong, instead of always saying "Could not save file to:" regardless of
+-- cause. A module-level function, defined outside any loop -- this file
+-- never shadows the single-underscore gettext identifier, so every branch
+-- below can call _()/T() directly.
+function EbookFileWidget.downloadFailureText(reason, detail, path)
+    if reason == "unconfigured" then
+        return _("Set your server URL and API token in Settings before downloading.")
+    elseif reason == "redirect" then
+        return _("The server redirected the download. Check the server URL, or sign in to the Wi-Fi network first.")
+    elseif reason == "connection" then
+        if type(detail) == "string" and detail:find("timeout") then
+            return _("The download timed out. Check your Wi-Fi connection and try again.")
+        end
+        return _("Could not reach the server. Check your Wi-Fi connection and try again.")
+    elseif reason == "server" then
+        return T(_("The server could not send this file (HTTP %1)."), tostring(detail))
+    elseif reason == "incomplete" then
+        return _("The download was cut off before the whole file arrived. Try again.")
+    elseif reason == "open_failed" then
+        -- Verbatim, so existing translations still match.
+        return T(_("Could not save file to:\n%1"), BD.filepath(path))
+    elseif reason == "commit_failed" then
+        return T(_("Could not save file to:\n%1\nThe existing file could not be replaced."), BD.filepath(path))
+    end
+    return _("The download failed. Check network and settings, then try again.")
+end
+
 function EbookFileWidget:init()
     self.small_font = Font:getFace("smallffont")
     self.medium_font = Font:getFace("ffont")
@@ -141,18 +170,34 @@ function EbookFileWidget:downloadFile()
         -- inside the wake's callback -- including the "Downloading"
         -- announcement, which must not appear before the device is
         -- actually online (that would be exactly the silent-failure shape
-        -- REL-05 names). The wake sits outside the one-second delay, not
-        -- inside it: nesting the wake inside scheduleIn would mean the
-        -- delay elapses before the device even starts reconnecting.
+        -- REL-05 names). The wake sits outside the deferred tick, not
+        -- inside it: nesting the wake inside nextTick would mean the tick
+        -- ran before the device even starts reconnecting.
         local connect_callback = function()
+            -- CR-F6: no timeout -- this stays on screen for the whole
+            -- blocking transfer below, however long that takes, and is
+            -- closed explicitly the moment the transfer finishes.
             local info_down = InfoMessage:new{
                 text = _("Downloading. This might take a moment."),
-                timeout = 1,
             }
             UIManager:show(info_down, "flashui")
-            UIManager:scheduleIn(1, function()
-                local ok, code_or_reason = AudiobookshelfApi:downloadFile(self.book_id, self.ino, safeFilename, path)
-                if ok then
+            -- CR-F6: one tick, not one second. The overwrite ConfirmBox (the
+            -- caller of startDownloadFile) calls its ok_callback before
+            -- closing itself, and deferring one tick lets that dialog leave
+            -- the stack first.
+            UIManager:nextTick(function()
+                -- Scheduled tasks run before UIManager's own repaint
+                -- (uimanager.lua's _checkTasks then _repaint), so without
+                -- this the "Downloading" message would not actually paint
+                -- before the blocking call below stalls the event loop.
+                UIManager:forceRePaint()
+                -- CR-F5: pcall so an unexpected raise still closes the
+                -- progress message instead of leaving it stuck; treated as
+                -- a failure with no specific reason.
+                local pok, dl_ok, reason, detail = pcall(AudiobookshelfApi.downloadFile,
+                    AudiobookshelfApi, self.book_id, self.ino, safeFilename, path)
+                UIManager:close(info_down)
+                if pok and dl_ok then
                     MetadataWriter.writeAll(path .. "/" .. safeFilename, self.book_info)
 
                     local confirm = ConfirmBox:new{
@@ -171,10 +216,16 @@ function EbookFileWidget:downloadFile()
                     -- force full refresh / flash to avoid clipped rendering
                     UIManager:show(confirm, "flashui")
                 else
-                    logger.warn("EbookFileWidget: download failed:", code_or_reason)
+                    if not pok then
+                        logger.warn("EbookFileWidget: download raised:", dl_ok)
+                        reason, detail = nil, nil
+                    else
+                        logger.warn("EbookFileWidget: download failed:", reason, detail)
+                    end
+                    -- No timeout, like the success ConfirmBox above: a long
+                    -- download means the user may have looked away.
                     local info_err = InfoMessage:new{
-                        text = T(_("Could not save file to:\n%1"), BD.filepath(path)),
-                        timeout = 3,
+                        text = EbookFileWidget.downloadFailureText(reason, detail, path),
                     }
                     UIManager:show(info_err, "flashui")
                 end

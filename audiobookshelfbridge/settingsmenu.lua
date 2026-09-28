@@ -143,6 +143,11 @@ function SettingsMenu:editServer()
                     callback = function()
                         local value = dialog:getInputText()
                         local trimmed = value:match("^%s*(.-)%s*$") or ""
+                        -- CR-F4: normalize before validating and saving, so
+                        -- "https://host/" is stored as "https://host" and a
+                        -- trailing-slash-only value reads as invalid rather
+                        -- than as a URL.
+                        trimmed = AudiobookshelfApi.normalizeServerUrl(trimmed)
                         if trimmed == "" or not (trimmed:match("^http://") or trimmed:match("^https://")) then
                             UIManager:show(InfoMessage:new{
                                 text = _("Server URL must start with http:// or https://"),

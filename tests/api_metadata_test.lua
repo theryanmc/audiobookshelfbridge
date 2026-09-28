@@ -13,7 +13,12 @@ package.loaded["socket.http"] = {request=function(request)
     assert(request.headers["Content-Type"] == "application/json")
     assert(tonumber(request.headers["Content-Length"]) == #request.source())
     assert(#body_ids <= 100)
-    if mode == "connection" then error("transport failed") end
+    -- The real socket.protect'd request never raises on a transport
+    -- failure -- it returns nil, "<err>" (CR-L1). "raised" keeps the old
+    -- shape to prove a genuinely caught error is still classified the
+    -- same way.
+    if mode == "connection" then return nil, "timeout" end
+    if mode == "raised" then error("transport failed") end
     if mode == "redirect" then return 1, 302 end
     if mode == "server" then return 1, 500 end
     response = {}
@@ -54,10 +59,13 @@ for i=1,205 do items[i]={id=tostring(i)} end
 local expanded = assert(Api:getLibraryItemsMetadata(items))
 assert(#expanded == 205 and calls == 3 and resets == calls)
 for i=1,205 do assert(expanded[i].id == items[i].id) end
-for _, failure in ipairs({"missing", "malformed", "foreign", "duplicate", "connection", "redirect", "server"}) do
+for _, failure in ipairs({"missing", "malformed", "foreign", "duplicate", "connection", "raised", "redirect", "server"}) do
     mode = failure
     local result, reason = Api:getLibraryItemsMetadata(items)
     assert(result == nil and reason ~= nil, failure)
+    if failure == "connection" or failure == "raised" then
+        assert(reason == "connection", failure)
+    end
     assert(resets == calls, failure)
 end
 local before = calls
