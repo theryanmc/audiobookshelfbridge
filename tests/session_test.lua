@@ -1246,6 +1246,94 @@ assert(#infomessage_calls == 1 and infomessage_calls[1].text:find("API token", 1
 recordFallbackText(infomessage_calls[1].text)
 print("PASS: the browser shows the fallback notice exactly once and routes token_rejected to Settings")
 
+-- runConnectionTest (GKC-D5/GKC-D4): names the method, or shows the single
+-- combined fallback message, then refreshes the rows to signed out.
+signInFreshSession()
+ME_MODE = "ok"
+infomessage_calls = {}
+local rc_session_menu = SettingsMenu:new{}
+rc_session_menu:runConnectionTest()
+assert(#infomessage_calls == 1)
+assert(infomessage_calls[1].text == "Connected to https://books.example.com (signed in)")
+recordFallbackText(infomessage_calls[1].text)
+
+resetAll()
+settings_table.server = "https://books.example.com"
+settings_table.token = "APITOKEN-SECRET"
+ME_MODE = "ok"
+infomessage_calls = {}
+local rc_token_menu = SettingsMenu:new{}
+rc_token_menu:runConnectionTest()
+assert(#infomessage_calls == 1)
+assert(infomessage_calls[1].text == "Connected to https://books.example.com (API token)")
+recordFallbackText(infomessage_calls[1].text)
+
+signInWithToken()
+local RC_ME_SEQUENCE_FB = { "401", "ok" }
+local original_me_dispatch_rc_fb = meResponse
+meResponse = function(request)
+    ME_MODE = table.remove(RC_ME_SEQUENCE_FB, 1) or "ok"
+    return original_me_dispatch_rc_fb(request)
+end
+REFRESH_MODE = "401"
+me_requests, refresh_requests = {}, {}
+infomessage_calls = {}
+local rc_fb_menu = SettingsMenu:new{}
+local before_rc_fb = #error_log
+rc_fb_menu:runConnectionTest()
+meResponse = original_me_dispatch_rc_fb
+assert(#infomessage_calls == 1)
+assert(infomessage_calls[1].text == "Your sign-in expired. Connected to https://books.example.com with your API token.")
+recordFallbackText(infomessage_calls[1].text)
+assert(rowOfType(rc_fb_menu.item_table, "sign_in").text == "Sign in with username and password")
+assert(rowOfType(rc_fb_menu.item_table, "sign_out") == nil)
+assert(rowOfType(rc_fb_menu.item_table, "token").text == "API token: configured")
+assert(Api:takeFallbackNotice() == nil)
+assert(#error_log - before_rc_fb == 1)
+assert(error_log[#error_log] == "Sign-in expired; now using the API token")
+
+signInWithToken()
+local RC_ME_SEQUENCE_REJ = { "401", "401" }
+local original_me_dispatch_rc_rej = meResponse
+meResponse = function(request)
+    ME_MODE = table.remove(RC_ME_SEQUENCE_REJ, 1) or "401"
+    return original_me_dispatch_rc_rej(request)
+end
+REFRESH_MODE = "401"
+me_requests, refresh_requests = {}, {}
+infomessage_calls = {}
+local rc_rej_menu = SettingsMenu:new{}
+local before_rc_rej = #error_log
+rc_rej_menu:runConnectionTest()
+meResponse = original_me_dispatch_rc_rej
+assert(#infomessage_calls == 1)
+assert(infomessage_calls[1].text == "Connection failed: Invalid or expired API token")
+recordFallbackText(infomessage_calls[1].text)
+assert(rowOfType(rc_rej_menu.item_table, "sign_in").text == "Sign in with username and password")
+assert(rowOfType(rc_rej_menu.item_table, "sign_out") == nil)
+assert(#error_log - before_rc_rej == 1)
+assert(error_log[#error_log] == "Sign-in expired and the API token was rejected (401)")
+REFRESH_MODE = "ok"
+print("PASS: runConnectionTest names the method, shows the combined fallback message once, and refreshes the rows to signed out")
+
+-- Libraries screen fallback (GKC-D4).
+signInWithToken()
+LIBS_RESPONSES = { { mode = "401" }, { mode = "ok" } }
+REFRESH_MODE = "401"
+libs_requests, refresh_requests = {}, {}
+infomessage_calls = {}
+local lib_fb_menu = SettingsMenu:new{}
+local before_lib_fb = #error_log
+local lib_fb_rows = lib_fb_menu:genLibraryVisibilityItemTable()
+assert(lib_fb_rows[1].text == "Library One")
+assert(#infomessage_calls == 1)
+recordFallbackText(infomessage_calls[1].text)
+assert(rowOfType(lib_fb_menu.item_table, "sign_in").text == "Sign in with username and password")
+assert(Api:takeFallbackNotice() == nil)
+assert(#error_log - before_lib_fb == 1)
+assert(error_log[#error_log] == "Sign-in expired; now using the API token")
+print("PASS: the Libraries screen shows the fallback notice once and refreshes the parent rows to signed out")
+
 REFRESH_MODE = "ok"
 
 -- 11. Secret scan -----------------------------------------------------------

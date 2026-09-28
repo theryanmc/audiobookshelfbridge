@@ -330,6 +330,18 @@ assert(session_expired_msg ~= distinct.server)
 assert(session_expired_msg ~= timeout_msg)
 print("PASS: downloadFailureText(session_expired) is its own message, distinct from every other reason")
 
+-- GKC-D2: token_rejected gets its own message too, distinct from every
+-- other reason above, including session_expired.
+local token_rejected_msg = EbookFileWidget.downloadFailureText("token_rejected", nil, "/x")
+assert(type(token_rejected_msg) == "string" and #token_rejected_msg > 0)
+assert(token_rejected_msg ~= distinct.unconfigured)
+assert(token_rejected_msg ~= distinct.redirect)
+assert(token_rejected_msg ~= distinct.incomplete)
+assert(token_rejected_msg ~= distinct.server)
+assert(token_rejected_msg ~= timeout_msg)
+assert(token_rejected_msg ~= session_expired_msg)
+print("PASS: downloadFailureText(token_rejected) is its own message, distinct from every other reason")
+
 -- Full download flow: http stub times out.
 ui_events = {}
 infomessage_calls = {}
@@ -384,3 +396,52 @@ assert(force_repaint_idx < close_progress_idx, "the repaint must happen before t
 assert(close_progress_idx < show_failure_idx, "the progress message must close before the failure message shows")
 
 print("PASS: download flow shows progress with no timeout, repaints, closes, then shows the failure reason")
+
+-- GKC-D4: the download flow shows the fallback notice once, after the
+-- failure result, using a consume-once stub for takeFallbackNotice so this
+-- file need not drive api.lua's own withAuth fallback machinery to prove
+-- it.
+local saved_take_fallback_notice = Api.takeFallbackNotice
+local NOTICE_SEQUENCE = { "NOTICE-TEXT" }
+Api.takeFallbackNotice = function(_self)
+    return table.remove(NOTICE_SEQUENCE, 1)
+end
+
+local function runDownloadFlow()
+    local flow_widget = setmetatable({
+        filename = "book.epub",
+        ino = "ino1",
+        book_id = "item1",
+        size_in_bytes = 1000,
+        book_info = { id = "item1" },
+    }, { __index = EbookFileWidget })
+    flow_widget:downloadFile()
+    local flow_button
+    for _, row in ipairs(flow_widget.download_dialog.buttons) do
+        for _, button in ipairs(row) do
+            if button.text == "Download" then flow_button = button end
+        end
+    end
+    flow_button.callback()
+end
+
+MODE = "timeout"
+ui_events = {}
+infomessage_calls = {}
+runDownloadFlow()
+assert(#infomessage_calls == 3, "expected progress, failure, and the fallback notice")
+local notice_widget = infomessage_calls[3]
+assert(notice_widget.text == "NOTICE-TEXT")
+assert(notice_widget.timeout == 3)
+local show_failure_idx2 = eventIndex("show", infomessage_calls[2])
+local show_notice_idx = eventIndex("show", notice_widget)
+assert(show_failure_idx2 and show_notice_idx and show_failure_idx2 < show_notice_idx,
+    "the notice must show after the failure message")
+
+ui_events = {}
+infomessage_calls = {}
+runDownloadFlow()
+assert(#infomessage_calls == 2, "the consume-once stub returns nil on the second run")
+
+Api.takeFallbackNotice = saved_take_fallback_notice
+print("PASS: the download flow shows the fallback notice once, after the failure result")

@@ -51,6 +51,10 @@ function EbookFileWidget.downloadFailureText(reason, detail, path)
         return _("Set your server URL and sign in (or add an API token) in Settings before downloading.")
     elseif reason == "session_expired" then
         return _("Your sign-in has expired. Sign in again in Settings, then retry the download.")
+    elseif reason == "token_rejected" then
+        -- GKC-D2: the session could not be renewed and the stored API
+        -- token was rejected too -- distinct from session_expired above.
+        return _("Your sign-in expired and the server rejected your API token. Sign in again or update the API token in Settings, then retry the download.")
     elseif reason == "redirect" then
         return _("The server redirected the download. Check the server URL, or sign in to the Wi-Fi network first.")
     elseif reason == "connection" then
@@ -230,6 +234,18 @@ function EbookFileWidget:downloadFile()
                         text = EbookFileWidget.downloadFailureText(reason, detail, path),
                     }
                     UIManager:show(info_err, "flashui")
+                end
+                -- GKC-D4: shown after the whole success/failure result
+                -- above (MetadataWriter.writeAll included), so it lands on
+                -- top of whichever message that just showed. No extra tick
+                -- needed -- this already runs inside the post-download
+                -- tick.
+                local notice = AudiobookshelfApi:takeFallbackNotice()
+                if notice then
+                    UIManager:show(InfoMessage:new{
+                        text = notice,
+                        timeout = 3,
+                    })
                 end
             end)
         end

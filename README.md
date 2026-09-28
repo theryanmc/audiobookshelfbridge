@@ -41,8 +41,9 @@ you use on the Audiobookshelf web interface.
 In Settings, set your **Server URL**, then choose **Sign in with username and
 password** and enter your credentials. The plugin keeps a sign-in session and
 renews it on its own — the password itself is never stored. If the server
-ever ends the session, the plugin sends you to Settings so you can sign in
-again.
+ever ends the session, the plugin switches to your API token when one is
+stored, and tells you once that it did; otherwise it sends you to Settings
+so you can sign in again.
 
 ### Or use an API token
 
@@ -57,7 +58,7 @@ user — the API token is shown on that page. Newer server versions manage these
 under **Settings → API Keys** instead.
 
 Treat the token like a password: it grants access to your library. A stored
-token is not used while you are signed in.
+token is not used while you are signed in, but it takes over automatically if your sign-in expires.
 
 ## Configure
 
@@ -75,7 +76,7 @@ top right.
 | **Download folder** | Where downloaded ebooks are saved. |
 | **Libraries** | Hide libraries you don't want in the browser. |
 | **Book view** | `cover tiles` or `list`. |
-| **Test connection** | Checks the URL together with your sign-in or token, and reports which one failed. |
+| **Test connection** | Checks the URL together with your sign-in or token, and reports which one it used, or which one failed. |
 | **Recent errors** | Failures recorded this session — the first place to look when something doesn't work. |
 
 Set the server URL, then sign in (or add a token), then use **Test

@@ -457,6 +457,22 @@ end
 function SettingsMenu:genLibraryVisibilityItemTable()
     local item_table = {}
     local libraries = AudiobookshelfApi:getLibraries()
+    local notice = AudiobookshelfApi:takeFallbackNotice()
+    if notice then
+        -- GKC-D4: deferred one tick -- showLibraryVisibility shows the
+        -- child Menu built from this table only after this method
+        -- returns, so a synchronous show here would land underneath it.
+        UIManager:nextTick(function()
+            UIManager:show(InfoMessage:new{
+                text = notice,
+                timeout = 3,
+            })
+        end)
+        -- The fallback means isSignedIn() is now false -- refresh the
+        -- parent Settings rows so they show signed out when the user
+        -- backs out of this child Menu.
+        self:refresh()
+    end
     if not libraries or #libraries == 0 then
         table.insert(item_table, {
             text = _("Could not load libraries. Check your connection and settings."),
@@ -513,16 +529,43 @@ function SettingsMenu:showLibraryVisibility()
     UIManager:show(menu)
 end
 
+-- GKC-D5/GKC-D4: names the method that answered, or -- when this very call
+-- triggered the API-token fallback -- shows the single combined message
+-- instead. The notice is taken (not just peeked) here regardless of
+-- outcome, so a pending notice from a fallback whose token retry then
+-- failed for some other, unrelated reason still surfaces exactly once.
 function SettingsMenu:runConnectionTest()
-    local ok, error_text = AudiobookshelfApi:testConnection()
+    local ok, result, fell_back = AudiobookshelfApi:testConnection()
+    local notice = AudiobookshelfApi:takeFallbackNotice()
+    local server = Settings:read("server", "")
     if ok then
+        local text, timeout
+        if fell_back then
+            text = T(_("Your sign-in expired. Connected to %1 with your API token."), server)
+            timeout = 3
+        elseif result == "session" then
+            text = T(_("Connected to %1 (signed in)"), server)
+            timeout = 2
+        else
+            text = T(_("Connected to %1 (API token)"), server)
+            timeout = 2
+        end
         UIManager:show(InfoMessage:new{
-            text = T(_("Connection to %1 succeeded"), Settings:read("server", "")),
-            timeout = 2,
+            text = text,
+            timeout = timeout,
         })
     else
         UIManager:show(InfoMessage:new{
-            text = T(_("Connection failed: %1"), error_text),
+            text = T(_("Connection failed: %1"), result),
+        })
+    end
+    -- A successful fallback already says so in the combined message above;
+    -- anything else (including a fallback whose own token retry then
+    -- failed for a non-401 reason) gets the notice shown separately.
+    if notice and not (ok and fell_back) then
+        UIManager:show(InfoMessage:new{
+            text = notice,
+            timeout = 3,
         })
     end
     self:refresh()
