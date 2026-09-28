@@ -21,6 +21,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit
+
+      # No release archive from a commit whose tests fail.
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          for t in tests/*.lua; do
+            echo "== $t =="
+            luajit "$t"
+          done
+
       - name: Build release archive
         run: python3 scripts/package_release.py
 
