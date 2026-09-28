@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+- Keep the browser usable when a book's details fail to load; the error message
+  is shown without leaving an invisible screen that blocked every tap and key.
+- Enforce total time limits on library, search, item and cover requests, so
+  slow Wi-Fi can no longer stall the reader indefinitely. Ebook downloads keep
+  no total limit and still stop if the connection goes silent.
+- Load each cover tile once and move D-pad focus by changing only its border,
+  so browsing no longer re-reads covers or makes requests on every key press.
+- Remember covers the server reports as missing for the rest of the session,
+  instead of re-requesting them and showing "Loading covers" on every visit.
+  Network errors are still retried.
+
 ## 0.3.0
 
 - Added Books, Series, and Authors tabs to the library browser, with ebook
