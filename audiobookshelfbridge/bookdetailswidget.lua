@@ -1,5 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local CoverCache = require("audiobookshelfbridge/covercache")
 local EbookFileWidget = require("audiobookshelfbridge/ebookfilewidget")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local FocusManager = require("ui/widget/focusmanager")
@@ -26,6 +27,7 @@ local Screen = Device.screen
 local Event = require("ui/event")
 local AudiobookshelfApi = require("audiobookshelfbridge/api")
 local InfoMessage = require("ui/widget/infomessage")
+local logger = require("logger")
 local _ = require("gettext")
 
 local BookDetailsWidget = FocusManager:extend{
@@ -125,12 +127,26 @@ function BookDetailsWidget:genFileList()
         height =  screen_height * 0.2,
     }
     for _, file in ipairs(self.book_info.libraryFiles or {}) do
-        if file.fileType == "ebook" then
+        -- CR-L2: every field below is server-supplied and untrusted in
+        -- shape. `type(file) == "table"` must short-circuit first -- Lua
+        -- indexing a bare number or string entry the fixture also carries
+        -- would otherwise raise (a string indexes as nil via its own
+        -- metatable, but a number does not). The ino check matters most:
+        -- the download URL is built from file.ino outside any pcall, and
+        -- util.urlEncode(nil) returns nil, so a nil ino would raise
+        -- "attempt to concatenate a nil value" the moment a download is
+        -- attempted.
+        if type(file) == "table" and file.fileType == "ebook"
+                and type(file.metadata) == "table"
+                and type(file.metadata.filename) == "string" and file.metadata.filename ~= ""
+                and (type(file.ino) == "string" and file.ino ~= "" or type(file.ino) == "number") then
             local file_widget = EbookFileWidget:new{
                 width = screen_width,
                 ino = file.ino,
                 filename = file.metadata.filename,
-                size_in_bytes =  file.metadata.size,
+                -- tonumber(nil) is nil, which falls back to
+                -- EbookFileWidget's own default of 0.
+                size_in_bytes = tonumber(file.metadata.size),
                 book_id = self.book_info.id,
                 book_info = self.book_info,
                 show_parent = self,
@@ -267,7 +283,17 @@ function BookDetailsWidget:genBookDetails()
         HorizontalSpan:new{ width = math.floor(screen_width * 0.05) }
     }
 
-    local image = AudiobookshelfApi:getLibraryItemCover(self.book_id)
+    -- CR-L4: through CoverCache instead of an uncached direct API call, so
+    -- book details shares the disk cache and the session 404 memory (D-02)
+    -- with the grid tiles (covergrid.lua). No width/height passed:
+    -- RenderImage's decoder stretches to an exact box when given both, with
+    -- no aspect handling, so decoding at native size is what lets the
+    -- aspect-preserving scale-down block below keep working unchanged.
+    local cover_ok, image = pcall(function() return CoverCache:get(self.book_id) end)
+    if not cover_ok then
+        logger.warn("BookDetailsWidget: cover fetch raised:", image)
+        image = nil
+    end
 
     if image then
         local actual_w, actual_h = image:getWidth(), image:getHeight()
@@ -277,10 +303,18 @@ function BookDetailsWidget:genBookDetails()
             actual_h = math.min(math.floor(actual_h * scale_factor)+1, img_height)
             image = RenderImage:scaleBlitBuffer(image , actual_w, actual_h, true)
         end
+        -- Ownership (CR-L4): CoverCache:get decodes a fresh BlitBuffer on
+        -- every call -- it caches encoded bytes on disk, never a decoded
+        -- buffer, and CoverTile's buffers (covergrid.lua) are separate
+        -- decodes. scaleBlitBuffer(..., true) above frees the pre-scale
+        -- original, and image_disposable = true means ImageWidget frees
+        -- the final buffer when this screen closes -- exactly one owner,
+        -- so no double free and no leak.
         table.insert(book_details_group, ImageWidget:new{
             image = image,
             width = actual_w,
-            height = actual_h
+            height = actual_h,
+            image_disposable = true,
         })
     end
 

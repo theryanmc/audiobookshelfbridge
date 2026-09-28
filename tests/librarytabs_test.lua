@@ -175,4 +175,75 @@ function Api:getLibraryItems() return {} end
 browser:openLibrary("library-d", "D")
 deferred()
 assert(browser.library_id == "library-d" and browser.library_tab == "books")
+
+-- CR-L2: malformed nested server fields (missing tables, empty ids, a bare
+-- number or string in an item list) are skipped by the real browser code
+-- instead of raising, and no placeholder text is invented for them.
+package.loaded["ui/uimanager"].show = function() end
+browser.ebook_ids = { b1 = true, ok1 = true, au1 = true }
+
+function Api:getSearchResults(_library_id, _query)
+    return {
+        authors = {
+            { id = "a1", name = "Alpha" },        -- well-formed
+            { id = "", name = "Bad" },             -- empty id
+            { id = "a2" },                          -- missing name
+            "not-a-table",
+            42,
+        },
+        series = {
+            { series = { id = "s1", name = "Series One" } }, -- well-formed
+            { series = { id = "", name = "Bad" } },           -- empty id
+            { series = "not-a-table" },                       -- malformed series field
+            { series = { id = "s2" } },                        -- missing name
+            "not-a-table",
+        },
+        book = {
+            -- well-formed and in ebook_ids
+            { libraryItem = { id = "b1", media = { metadata = { title = "Book One", authorName = "Writer" } } } },
+            -- well-formed but NOT in ebook_ids
+            { libraryItem = { id = "b2", media = { metadata = { title = "Book Two" } } } },
+            { libraryItem = { id = "b3" } },                  -- missing media
+            { libraryItem = "not-a-table" },                  -- malformed libraryItem
+            { libraryItem = { id = "", media = { metadata = { title = "x" } } } }, -- empty id
+            "not-a-table",
+        },
+    }
+end
+browser:loadLibrarySearch("q")
+assert(#browser.item_table == 3, "expected exactly one author, series and book row")
+assert(browser.item_table[1].type == "author" and browser.item_table[1].id == "a1"
+    and browser.item_table[1].text == "Alpha")
+assert(browser.item_table[2].type == "series" and browser.item_table[2].id == "s1"
+    and browser.item_table[2].text == "Series One")
+assert(browser.item_table[3].type == "book" and browser.item_table[3].id == "b1"
+    and browser.item_table[3].mandatory == "Writer")
+
+function Api:getSeriesItems(_library_id, _series_id)
+    return {
+        { id = "ok1", media = { metadata = { title = "Good Series Book" } } }, -- well-formed, in ebook_ids
+        42,
+        "bad-string",
+        { id = "", media = { metadata = { title = "x" } } },
+        { id = "ok2" }, -- missing media
+    }
+end
+browser:openSeries("s1", "S", browser.library_id)
+assert(#browser.item_table == 1, "expected exactly one series-drill-in row")
+assert(browser.item_table[1].id == "ok1" and browser.item_table[1].type == "book")
+
+function Api:getAuthorItems(_author_id)
+    return {
+        { id = "au1", media = { metadata = { title = "Good Author Book", authorName = "Someone" } } }, -- in ebook_ids
+        42,
+        "bad-string",
+        { id = "", media = { metadata = { title = "x" } } },
+        { id = "au2" }, -- missing media
+    }
+end
+browser:openAuthor("author-x", "Author X", browser.library_id)
+assert(#browser.item_table == 1, "expected exactly one author-drill-in row")
+assert(browser.item_table[1].id == "au1" and browser.item_table[1].mandatory == "Someone")
+
+print("PASS: malformed search/series/author entries are skipped, no placeholder text invented")
 print("PASS: grouping, tab state, header controls, back navigation, library isolation, and root exit")

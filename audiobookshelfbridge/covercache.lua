@@ -78,9 +78,11 @@ local function usableFile(path)
     return true
 end
 
--- Keeps the directory under MAX_ENTRIES by removing least-recently-modified
--- files first. Runs after a successful store, so the cache is trimmed on the
--- path that grows it rather than on the read path.
+-- Keeps the directory under MAX_ENTRIES by removing least-recently-used
+-- files first (CR-L3: a cache-hit read in CoverCache:get refreshes mtime,
+-- so this is genuinely LRU, not just least-recently-written). Runs after a
+-- successful store, so the cache is trimmed on the path that grows it
+-- rather than on the read path.
 function CoverCache:evict()
     local dir = ensureDir()
     if not dir then
@@ -132,7 +134,15 @@ function CoverCache:get(id, width, height)
         return image
     end
 
-    if not usableFile(path) then
+    if usableFile(path) then
+        -- CR-L3: a cache hit -- refresh mtime so evict()'s eviction order
+        -- reflects reads, not just writes. Neither a raise nor a nil, err
+        -- return is logged: a failed touch only degrades eviction back to
+        -- FIFO, and a log line here would fire on every tile read on a
+        -- read-only filesystem. Not called after a fresh download just
+        -- below -- that file's mtime is already current.
+        pcall(lfs.touch, path)
+    else
         local ok, code = AudiobookshelfApi:downloadCover(id, path)
         if not ok or not usableFile(path) then
             -- downloadCover logs and, per OD-2, deliberately does not record a

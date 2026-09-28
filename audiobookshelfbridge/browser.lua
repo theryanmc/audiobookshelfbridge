@@ -56,6 +56,36 @@ local function compareByTitle(a, b)
     return (a.text or "") < (b.text or "")
 end
 
+-- CR-L2: true for a value usable as a row id -- the same rule
+-- LibraryTabs.build applies. No gettext here: every loop that calls this
+-- binds `_` as its own throwaway key variable.
+local function usableId(value)
+    return type(value) == "string" and value ~= ""
+end
+
+-- CR-L2: nested server fields (media, media.metadata, a series sub-table)
+-- are untrusted in both shape and content -- a response missing one of them
+-- used to raise and take the browser or the details screen down with it.
+-- Returns id, title, author_name, metadata for a library-item-shaped value,
+-- or nil when it is malformed; no placeholder text is invented for a
+-- malformed entry, it is simply skipped by every caller below.
+-- author_name is metadata.authorName only when that is a string -- the
+-- mandatory column is optional everywhere a caller uses this.
+local function bookRow(item)
+    if type(item) ~= "table" or not usableId(item.id) then
+        return nil
+    end
+    if type(item.media) ~= "table" or type(item.media.metadata) ~= "table" then
+        return nil
+    end
+    local metadata = item.media.metadata
+    if type(metadata.title) ~= "string" then
+        return nil
+    end
+    local author_name = type(metadata.authorName) == "string" and metadata.authorName or nil
+    return item.id, metadata.title, author_name, metadata
+end
+
 local AudiobookshelfBrowser = Menu:extend{
     no_title = false,
     title = _("Audiobookshelf Bridge"),
@@ -514,12 +544,17 @@ function AudiobookshelfBrowser:loadLibrarySearch(search)
     -- entire server, audiobooks included -- not the number D-03 wanted and
     -- it cannot be made into it.
     for _, entry in ipairs(results.authors or {}) do
-        table.insert(tbl, {
-            id = entry.id,
-            text = entry.name,
-            mandatory = author_label,
-            type = "author"
-        })
+        -- CR-L2: skip an entry that is not a table, or lacks a usable id
+        -- or a non-empty string name, instead of raising on it.
+        if type(entry) == "table" and usableId(entry.id)
+                and type(entry.name) == "string" and entry.name ~= "" then
+            table.insert(tbl, {
+                id = entry.id,
+                text = entry.name,
+                mandatory = author_label,
+                type = "author"
+            })
+        end
     end
 
     -- D-18: no count and no drop rule for a series row -- a series with
@@ -529,12 +564,18 @@ function AudiobookshelfBrowser:loadLibrarySearch(search)
     -- `authors` the server force-empties (advplyr/audiobookshelf#4205), and
     -- not reading it is what satisfies SRCH-08 by construction.
     for _, entry in ipairs(results.series or {}) do
-        table.insert(tbl, {
-            id = entry.series.id,
-            text = entry.series.name,
-            mandatory = series_label,
-            type = "series"
-        })
+        -- CR-L2: entry.series is read only when it is itself a table, and
+        -- skipped under the same id/name rule as the authors loop above.
+        local series = type(entry) == "table" and entry.series
+        if type(series) == "table" and usableId(series.id)
+                and type(series.name) == "string" and series.name ~= "" then
+            table.insert(tbl, {
+                id = series.id,
+                text = series.name,
+                mandatory = series_label,
+                type = "series"
+            })
+        end
     end
 
     -- Books group keeps its existing row shape and author-in-mandatory
@@ -545,13 +586,19 @@ function AudiobookshelfBrowser:loadLibrarySearch(search)
     -- of "has an ebook" for this group, and it is the same definition the
     -- drill-in lists use. No re-sort: relevance order is the server's.
     for _, item in ipairs(results.book or {}) do
-        if ebook_ids[item.libraryItem.id] then
-            table.insert(tbl, {
-                id = item.libraryItem.id,
-                text = item.libraryItem.media.metadata.title,
-                mandatory = item.libraryItem.media.metadata.authorName,
-                type = "book"
-            })
+        -- CR-L2: item.libraryItem is read only when it is a table, then
+        -- run through bookRow's shape check; a nil result is skipped.
+        local library_item = type(item) == "table" and item.libraryItem
+        if type(library_item) == "table" then
+            local id, title, author_name = bookRow(library_item)
+            if id and ebook_ids[id] then
+                table.insert(tbl, {
+                    id = id,
+                    text = title,
+                    mandatory = author_name,
+                    type = "book"
+                })
+            end
         end
     end
 
@@ -647,13 +694,17 @@ function AudiobookshelfBrowser:openSeries(series_id, series_name, library_id)
     -- comparison (D-15, D-19).
     local rows = {}
     for _, item in ipairs(items) do
-        if ebook_ids[item.id] then
+        -- CR-L2: bookRow's shape check replaces the raw item.media.metadata
+        -- chain; a malformed item is skipped rather than raising.
+        local id, title, _author_name, metadata = bookRow(item)
+        if id and ebook_ids[id] then
             -- D-12: read the sequence from the series sub-table the scoped
             -- call attached for the series being drilled into, ignoring the
             -- book's other series memberships entirely. The server attaches
             -- this sub-table with id/name/sequence precisely when the
-            -- filter group is `series`.
-            local series_info = item.media and item.media.metadata and item.media.metadata.series
+            -- filter group is `series`. Read only when it is itself a table
+            -- (CR-L2).
+            local series_info = type(metadata.series) == "table" and metadata.series
             local sequence = series_info and series_info.sequence
             local mandatory
             if sequence and sequence ~= "" then
@@ -664,8 +715,8 @@ function AudiobookshelfBrowser:openSeries(series_id, series_name, library_id)
                 mandatory = NO_SEQUENCE_LABEL
             end
             table.insert(rows, {
-                id = item.id,
-                text = item.media.metadata.title,
+                id = id,
+                text = title,
                 mandatory = mandatory,
                 sequence = sequence,
                 type = "book"
@@ -734,11 +785,14 @@ function AudiobookshelfBrowser:openAuthor(author_id, author_name, library_id)
     -- position-instead-of-author swap applies to series lists only.
     local rows = {}
     for _, item in ipairs(items) do
-        if ebook_ids[item.id] then
+        -- CR-L2: bookRow's shape check replaces the raw item.media.metadata
+        -- chain; a malformed item is skipped rather than raising.
+        local id, title, author_name = bookRow(item)
+        if id and ebook_ids[id] then
             table.insert(rows, {
-                id = item.id,
-                text = item.media.metadata.title,
-                mandatory = item.media.metadata.authorName,
+                id = id,
+                text = title,
+                mandatory = author_name,
                 type = "book"
             })
         end
