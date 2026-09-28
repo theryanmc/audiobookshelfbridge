@@ -33,7 +33,21 @@ Originally inspired by [naleo's Audiobookshelf plugin for KOReader](https://gith
 plugin directories whose name ends in `.koplugin`; renaming it means the plugin
 is silently ignored, with no error to tell you why.
 
-## Get an API token
+## Sign in
+
+The easiest way to connect is to sign in with the same username and password
+you use on the Audiobookshelf web interface.
+
+In Settings, set your **Server URL**, then choose **Sign in with username and
+password** and enter your credentials. The plugin keeps a sign-in session and
+renews it on its own — the password itself is never stored. If the server
+ever ends the session, the plugin sends you to Settings so you can sign in
+again.
+
+### Or use an API token
+
+If your server is too old to issue sign-in sessions, or you'd rather not
+type your password, an API token works the same way it always has.
 
 The plugin authenticates as your Audiobookshelf user, so it needs that user's
 API token.
@@ -42,7 +56,8 @@ In the Audiobookshelf web interface, open **Settings → Users** and select your
 user — the API token is shown on that page. Newer server versions manage these
 under **Settings → API Keys** instead.
 
-Treat the token like a password: it grants access to your library.
+Treat the token like a password: it grants access to your library. A stored
+token is not used while you are signed in.
 
 ## Configure
 
@@ -54,15 +69,17 @@ top right.
 | Setting | What it does |
 |---------|--------------|
 | **Server URL** | Your Audiobookshelf address, including the scheme — `https://books.example.com`. Must start with `http://` or `https://`. |
-| **API token** | The token from the step above. Shows `configured` once set, never the value. |
+| **Sign in with username and password** | Signs you in. Once signed in, this row shows `Signed in as …` — choose it again to sign in as someone else. |
+| **Sign out** | Only shown while signed in. Removes the session from this device and, when the reader is connected, asks the server to end it too. |
+| **API token** | The alternative to signing in. Shows `configured` once set, never the value. |
 | **Download folder** | Where downloaded ebooks are saved. |
 | **Libraries** | Hide libraries you don't want in the browser. |
 | **Book view** | `cover tiles` or `list`. |
-| **Test connection** | Checks the URL and token together and reports which one failed. |
+| **Test connection** | Checks the URL together with your sign-in or token, and reports which one failed. |
 | **Recent errors** | Failures recorded this session — the first place to look when something doesn't work. |
 
-Set the server URL and token, then use **Test connection** to confirm both
-before browsing.
+Set the server URL, then sign in (or add a token), then use **Test
+connection** to confirm before browsing.
 
 ### Configuring from a file instead
 
@@ -77,12 +94,15 @@ return {
 }
 ```
 
-The plugin also writes `download_dir` and `disabled_libraries` into this file as
-you change them. Neither needs to be present up front.
+That server + token file keeps working unchanged. Signing in from Settings
+instead writes `auth`, `access_token`, `refresh_token`, `session_host`, and
+`username` into this same file — none of them need to be present up front.
+The plugin also writes `download_dir` and `disabled_libraries` as you change
+them.
 
-This file holds your API token in plain text. It is already listed in
-`.gitignore` and excluded from release archives — keep it out of anything you
-publish or share.
+This file holds your API token or sign-in session in plain text. It is
+already listed in `.gitignore` and excluded from release archives — keep it
+out of anything you publish or share.
 
 ## Using it
 
@@ -157,12 +177,26 @@ books.
 
 Things worth knowing before you point this at a server you care about.
 
-- **Your API token is stored in plain text** in `audiobookshelfbridge_config.lua`
-  inside the plugin folder, with ordinary file permissions. On a single-user
-  e-reader that is fine. On a shared computer, anyone with access to your
-  files can read it.
-- **Use `https://`.** Over `http://` the token is sent unencrypted on every
-  request. The plugin warns once when you save an `http://` address.
+- **Your API token and sign-in session are stored in plain text** in
+  `audiobookshelfbridge_config.lua` inside the plugin folder, with ordinary
+  file permissions. On a single-user e-reader that is fine. On a shared
+  computer, anyone with access to your files can read it.
+- **Your password is never stored** or logged, on this device or anywhere
+  else. It is sent once, at sign-in, and lives only for the moment that
+  request is in flight.
+- **Use `https://`.** Over `http://` your password is sent unencrypted at
+  sign-in, and your token or session on every request after that. The plugin
+  warns in the sign-in dialog, and once when you save an `http://` server
+  address.
+- **A session is only ever sent to the server host that issued it.**
+  Switching between `http://` and `https://`, or changing the port or path,
+  keeps you signed in. Pointing Server URL at a different hostname signs you
+  out, so your session is never sent to another server.
+- **Sign out removes the session from this device immediately.** If the
+  reader is connected, it also asks the server to end that session. If it is
+  offline, or the server can't be reached, the server's own copy simply
+  expires on its own (30 days by default). Sign out never turns Wi-Fi on by
+  itself.
 - **KOReader does not verify TLS certificates.** Its bundled HTTPS library
   ships with verification turned off, and this plugin inherits that. `https://`
   still protects you from passive eavesdropping, but not from an attacker who
@@ -170,12 +204,13 @@ Things worth knowing before you point this at a server you care about.
   limitation; the plugin cannot fix it on its own.
 - **Redirects are refused.** The plugin never follows an HTTP redirect, so a
   captive-portal Wi-Fi network that redirects every request to its sign-in
-  page cannot be handed your token. If you see "the server redirected the
-  request", sign in to the network first or check the URL.
-- **Tokens never appear in logs or on screen.** The settings screen shows
-  `configured`, never the value; the token entry field is masked; and the
-  Recent errors list is built to never contain a token, header, or response
-  body.
+  page cannot be handed your password, token, or session. If you see "the
+  server redirected the request", sign in to the network first or check the
+  URL.
+- **Passwords and tokens never appear in logs or on screen.** The password
+  field is masked; the settings screen shows `configured` or `Signed in
+  as …`, never a value; and the Recent errors list is built to never contain
+  a password, token, header, or response body.
 
 ## Development and releases
 
