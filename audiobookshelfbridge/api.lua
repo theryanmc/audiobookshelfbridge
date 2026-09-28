@@ -165,8 +165,11 @@ function AudiobookshelfApi:getLibraries()
         return unconfigured("getLibraries")
     end
     local sink = {}
-    local request = buildRequest(server, token, "/api/libraries", ltn12.sink.table(sink))
+    -- socketutil.table_sink decides at construction time whether to enforce
+    -- the total timeout, so set_timeout must run before it is built --
+    -- otherwise it silently degrades to a plain ltn12 table sink.
     socketutil:set_timeout()
+    local request = buildRequest(server, token, "/api/libraries", socketutil.table_sink(sink))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
@@ -211,10 +214,10 @@ local function fetchAllPages(self, server, token, base_path, method_name)
     local all = {}
     for page = 0, ITEMS_MAX_PAGES - 1 do
         local sink = {}
+        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
         local request = buildRequest(server, token,
             base_path .. "&limit=" .. ITEMS_PAGE_SIZE .. "&page=" .. page,
-            ltn12.sink.table(sink))
-        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+            socketutil.table_sink(sink))
         local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
         local response = table.concat(sink)
         socketutil:reset_timeout()
@@ -309,14 +312,14 @@ function AudiobookshelfApi:getAuthorItems(author_id)
         return unconfigured("getAuthorItems")
     end
     local sink = {}
-    local request = buildRequest(server, token,
-        "/api/authors/" .. util.urlEncode(author_id) .. "?include=items,series",
-        ltn12.sink.table(sink))
     -- This endpoint takes no limit parameter -- bounded only by the
     -- author's whole bibliography -- so it belongs with the other
     -- unbounded list calls at the large-content timeouts rather than the
     -- argument-less 5s/15s default.
     socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+    local request = buildRequest(server, token,
+        "/api/authors/" .. util.urlEncode(author_id) .. "?include=items,series",
+        socketutil.table_sink(sink))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
@@ -358,12 +361,12 @@ function AudiobookshelfApi:getLibraryItemsMetadata(items)
         end
         local body = JSON.encode({ libraryItemIds = ids })
         local sink = {}
-        local request = buildRequest(server, token, "/api/items/batch/get", ltn12.sink.table(sink))
+        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        local request = buildRequest(server, token, "/api/items/batch/get", socketutil.table_sink(sink))
         request.method = "POST"
         request.headers["Content-Type"] = "application/json"
         request.headers["Content-Length"] = tostring(#body)
         request.source = ltn12.source.string(body)
-        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
         local ok, code = pcall(function() return socket.skip(1, http.request(request)) end)
         socketutil:reset_timeout()
         if not ok then
@@ -403,10 +406,10 @@ function AudiobookshelfApi:getLibraryItem(id)
         return unconfigured("getLibraryItem")
     end
     local sink = {}
+    socketutil:set_timeout()
     local request = buildRequest(server, token,
         "/api/items/" .. util.urlEncode(id) .. "?expanded=1",
-        ltn12.sink.table(sink))
-    socketutil:set_timeout()
+        socketutil.table_sink(sink))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
@@ -438,7 +441,13 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
         unconfigured("downloadFile")
         return false, "unconfigured"
     end
-    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    -- D-01: ebook downloads deliberately have no whole-transfer cap -- a
+    -- large book on slow Wi-Fi can legitimately take longer than any fixed
+    -- limit. This matches KOReader's OPDS downloader. With a negative
+    -- total, socketutil.file_sink below hands back the plain ltn12 file
+    -- sink; the block timeout still fails a connection that stops
+    -- delivering data.
+    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, -1)
     local fullpath = local_path .. "/" .. filename
     -- A-07 gap closure: the destination (fullpath) is never opened for
     -- writing and never removed anywhere in this function. The transfer
@@ -466,19 +475,20 @@ function AudiobookshelfApi:downloadFile(id, ino, filename, local_path)
     end
     local request = buildRequest(server, token,
         "/api/items/" .. util.urlEncode(id) .. "/file/" .. util.urlEncode(ino) .. "/download",
-        ltn12.sink.file(outfile))
+        socketutil.file_sink(outfile))
     local ok, code, headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
     if not ok or code ~= 200 then
-        -- ltn12.sink.file only closes outfile on a clean end-of-stream (a
-        -- chunk == nil signal from the pump); socket/http.lua's own `try`
-        -- wrapper raises a Lua error mid-transfer before the pump ever gets
-        -- there, so a caught error or a non-200 status both leave the
-        -- handle open and a truncated/error-page body on disk. Close inside
-        -- its own pcall -- the handle may already be invalid -- then
-        -- discard the staging file, and only the staging file. The
-        -- pre-existing destination, if any, is never touched by this
-        -- branch (A-07).
+        -- With the uncapped total set above, socketutil.file_sink is the
+        -- plain ltn12 file sink. That sink closes the handle only on a
+        -- clean end-of-stream; a transfer that errors or stalls (LuaSocket
+        -- "timeout" from the block timeout) leaves the handle open, so the
+        -- pcall-wrapped close stays -- a double close is harmless. Every
+        -- non-200 outcome takes this close-and-discard path, so the A-07
+        -- guarantee holds. Close inside its own pcall -- the handle may
+        -- already be invalid -- then discard the staging file, and only
+        -- the staging file. The pre-existing destination, if any, is never
+        -- touched by this branch (A-07).
         pcall(function() outfile:close() end)
         DownloadStaging.discard(temp_path)
         if ok and isRedirect(code) then
@@ -541,13 +551,13 @@ function AudiobookshelfApi:getLibraryItemCover(id)
         return nil
     end
     local sink = {}
-    local request = buildRequest(server, token,
-        "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
-        ltn12.sink.table(sink))
     -- Same endpoint/headers as downloadCover, which correctly uses the
     -- larger file-transfer timeouts; align this call so the Book Details
     -- cover thumbnail doesn't time out sooner than the sidecar cover write.
     socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    local request = buildRequest(server, token,
+        "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
+        socketutil.table_sink(sink))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
@@ -597,12 +607,13 @@ function AudiobookshelfApi:downloadCover(id, local_path)
     end
     local request = buildRequest(server, token,
         "/api/items/" .. util.urlEncode(id) .. "/cover?format=webp",
-        ltn12.sink.file(outfile))
+        socketutil.file_sink(outfile))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
     if not ok or code ~= 200 then
         -- Same close+remove cleanup as downloadFile, for the same reason:
-        -- the sink only closes the handle on a clean end-of-stream.
+        -- the sink only closes the handle on a clean end-of-stream or its
+        -- own sink timeout.
         pcall(function() outfile:close() end)
         os.remove(local_path)
         logger.warn("AudiobookshelfApi: cannot download cover:", id, ok and (status or code) or "error")
@@ -618,6 +629,10 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
     end
     local sink = {}
     local url_encoded_search_string = util.urlEncode(search_query)
+    -- This is a raised-limit search response on possibly-weak Wi-Fi -- use
+    -- the large-content timeouts rather than the argument-less 5s/15s
+    -- default.
+    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     -- The `filter` parameter that used to sit here is dead: the search
     -- controller behind this endpoint reads only the query text and the
     -- limit (verified against server source at release v2.36.0), so the
@@ -626,11 +641,7 @@ function AudiobookshelfApi:getSearchResults(id, search_query)
     -- (D-15/SRCH-07).
     local request = buildRequest(server, token,
         "/api/libraries/" .. util.urlEncode(id) .. "/search?q=" .. url_encoded_search_string .. "&limit=" .. SEARCH_GROUP_LIMIT,
-        ltn12.sink.table(sink))
-    -- This is a raised-limit search response on possibly-weak Wi-Fi -- use
-    -- the large-content timeouts rather than the argument-less 5s/15s
-    -- default.
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        socketutil.table_sink(sink))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     local response = table.concat(sink)
     socketutil:reset_timeout()
@@ -687,8 +698,8 @@ function AudiobookshelfApi:testConnection()
         return false, message
     end
     local sink = {}
-    local request = buildRequest(server, token, "/api/me", ltn12.sink.table(sink))
     socketutil:set_timeout()
+    local request = buildRequest(server, token, "/api/me", socketutil.table_sink(sink))
     local ok, code, _headers, status = pcall(function() return socket.skip(1, http.request(request)) end)
     socketutil:reset_timeout()
     if not ok then

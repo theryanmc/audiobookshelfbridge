@@ -4,7 +4,6 @@ local mode = "ok"
 package.loaded["ffi/util"] = {template=function(text) return text end}
 package.loaded.json = {encode=function(body) body_ids=body.libraryItemIds; return "encoded body" end}
 package.loaded.ltn12 = {
-    sink={table=function(sink) return function(data) sink[#sink+1]=data end end},
     source={string=function(body) return function() return body end end},
 }
 package.loaded["socket.http"] = {request=function(request)
@@ -31,7 +30,15 @@ package.loaded["socket.http"] = {request=function(request)
 end}
 package.loaded.socket = {skip=function(_, ...) return select(2, ...) end}
 local resets = 0
-package.loaded.socketutil = {set_timeout=function() end, reset_timeout=function() resets=resets+1 end}
+local timeout_active = false
+package.loaded.socketutil = {
+    set_timeout=function() timeout_active = true end,
+    reset_timeout=function() timeout_active = false; resets=resets+1 end,
+    table_sink=function(t)
+        assert(timeout_active, "sink built before set_timeout")
+        return function(data) t[#t+1]=data end
+    end,
+}
 package.loaded.logger = {warn=function() end}
 for _, name in ipairs({"ffi/sha2", "ui/renderimage", "util", "audiobookshelfbridge/downloadstaging"}) do
     package.loaded[name] = {}
