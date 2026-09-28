@@ -22,6 +22,13 @@ local CACHE_SUBDIR = "cache/audiobookshelfbridge"
 -- browsing and still small on the smallest device this runs on.
 local MAX_ENTRIES = 256
 
+-- D-02: ids whose cover endpoint answered HTTP 404 this session -- a
+-- definite "no cover". Lives in memory only and is never written to disk.
+-- Network errors, timeouts and other statuses are deliberately not
+-- recorded, so flaky Wi-Fi never hides a cover for the rest of the
+-- session.
+local missing = {}
+
 -- lfs.mkdir creates a single level, so walk the segments. Returns the
 -- directory path, or nil when it could not be created -- every caller treats
 -- that as "no cache available" and falls back to a direct fetch.
@@ -109,19 +116,34 @@ function CoverCache:get(id, width, height)
     if id == nil then
         return nil
     end
+    if missing[id] then
+        return nil
+    end
     local path = self:pathFor(id)
     if not path then
         -- No writable cache: fall back to the uncached in-memory fetch so the
-        -- caller still gets an image.
-        return AudiobookshelfApi:getLibraryItemCover(id)
+        -- caller still gets an image. Only a definite 404 is remembered
+        -- (D-02); a nil image with any other reason (or none at all) is
+        -- retried on the next visit.
+        local image, code = AudiobookshelfApi:getLibraryItemCover(id)
+        if image == nil and code == 404 then
+            missing[id] = true
+        end
+        return image
     end
 
     if not usableFile(path) then
-        local ok = AudiobookshelfApi:downloadCover(id, path)
+        local ok, code = AudiobookshelfApi:downloadCover(id, path)
         if not ok or not usableFile(path) then
             -- downloadCover logs and, per OD-2, deliberately does not record a
             -- missing cover as a user-facing error. A tile just renders its
-            -- fallback.
+            -- fallback. Per D-02, only a definite HTTP 404 is remembered for
+            -- the rest of the session -- a network error, a timeout, another
+            -- status, or a zero-byte body (which never sets `code`) is
+            -- retried on the next visit instead.
+            if code == 404 then
+                missing[id] = true
+            end
             return nil
         end
         self:evict()
@@ -132,7 +154,8 @@ function CoverCache:get(id, width, height)
     end)
     if not rendered or not image then
         -- A truncated or corrupt file decodes to nothing; drop it so the next
-        -- visit refetches instead of failing forever.
+        -- visit refetches instead of failing forever. Deliberately not
+        -- recorded as missing -- a decode failure is not a 404.
         logger.warn("CoverCache: cannot decode cached cover, dropping:", path)
         os.remove(path)
         return nil
@@ -151,7 +174,17 @@ function CoverCache:isCached(id)
     return path ~= nil and usableFile(path)
 end
 
+-- D-02: whether this id's cover fetch answered a definite HTTP 404 this
+-- session. A known-missing id is not "cached" (isCached above keeps its
+-- disk-file meaning), so this is a separate predicate.
+function CoverCache:isKnownMissing(id)
+    return id ~= nil and missing[id] == true
+end
+
 function CoverCache:clear()
+    -- Reset first, before the ensureDir early return, so the session
+    -- negative cache is cleared even when the disk cache is unavailable.
+    missing = {}
     local dir = ensureDir()
     if not dir then
         return 0

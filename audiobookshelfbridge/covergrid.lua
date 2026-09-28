@@ -65,18 +65,21 @@ function CoverTile:init()
             TapSelect = { GestureRange:new{ ges = "tap", range = self.dimen } },
         }
     end
-    self[1] = self:buildContent(false)
+    self[1] = self:buildContent()
 end
 
--- `focused` only changes the frame around the tile, so focus can be redrawn
--- without refetching or re-decoding the cover.
-function CoverTile:buildContent(focused)
+-- The one-time builder: the cover is fetched and decoded exactly once per
+-- tile. Focus flips only the stored frame's border color (onFocus/
+-- onUnfocus below); the border width is constant, so geometry never shifts
+-- and nothing is refetched or re-decoded.
+function CoverTile:buildContent()
     local padding = Size.padding.small
-    local caption_h = Screen:scaleBySize(28)
-    local inner_w = self.width - 2 * padding
-    local cover_h = self.height - caption_h - 2 * padding
+    local border = Size.border.thick
+    local caption_h = Screen:scaleBySize(CAPTION_DP)
+    local inner_w = self.width - 2 * (padding + border)
+    local cover_h = self.height - caption_h - 2 * (padding + border)
 
-    local cover = self:buildCover(inner_w, cover_h)
+    self.cover_widget = self:buildCover(inner_w, cover_h)
 
     local caption = TextBoxWidget:new{
         text = self.entry.text or "",
@@ -88,22 +91,23 @@ function CoverTile:buildContent(focused)
         height_overflow_show_ellipsis = true,
     }
 
-    return FrameContainer:new{
+    self.frame = FrameContainer:new{
         width = self.width,
         height = self.height,
         padding = padding,
-        bordersize = focused and Size.border.thick or 0,
-        color = Blitbuffer.COLOR_BLACK,
+        bordersize = border,
+        color = Blitbuffer.COLOR_WHITE,
         background = Blitbuffer.COLOR_WHITE,
         VerticalGroup:new{
             align = "center",
             CenterContainer:new{
                 dimen = Geom:new{ w = inner_w, h = cover_h },
-                cover,
+                self.cover_widget,
             },
             caption,
         },
     }
+    return self.frame
 end
 
 -- Returns the cover image, or a framed placeholder. A missing cover is normal
@@ -165,13 +169,13 @@ function CoverTile:buildCover(width, height)
 end
 
 function CoverTile:onFocus()
-    self[1] = self:buildContent(true)
+    self.frame.color = Blitbuffer.COLOR_BLACK
     UIManager:setDirty(self.menu.show_parent, "ui", self.dimen)
     return true
 end
 
 function CoverTile:onUnfocus()
-    self[1] = self:buildContent(false)
+    self.frame.color = Blitbuffer.COLOR_WHITE
     UIManager:setDirty(self.menu.show_parent, "ui", self.dimen)
     return true
 end
@@ -183,12 +187,16 @@ end
 
 -- How many covers on this page still need fetching. Only book rows have one,
 -- and isCached is a stat call, so this is cheap relative to the fetches it is
--- deciding whether to warn about.
+-- deciding whether to warn about. A known-missing cover (D-02: a definite
+-- HTTP 404 this session) is excluded too -- checked first since it is a
+-- table lookup and saves a stat.
 function CoverGrid.countUncached(menu, idx_offset, perpage)
     local pending = 0
     for idx = 1, perpage do
         local item = menu.item_table[idx_offset + idx]
-        if item and item.type == "book" and not CoverCache:isCached(item.id) then
+        if item and item.type == "book"
+                and not CoverCache:isKnownMissing(item.id)
+                and not CoverCache:isCached(item.id) then
             pending = pending + 1
         end
     end

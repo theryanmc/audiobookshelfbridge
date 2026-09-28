@@ -578,7 +578,9 @@ function AudiobookshelfApi:getLibraryItemCover(id)
     end
     logger.warn("AudiobookshelfApi: cannot get library item cover", id ,status or code)
     ErrorLog:record(T("getLibraryItemCover: server error: %1", tostring(status or code)))
-    return nil
+    -- Second value is the numeric HTTP status, so CoverCache can tell a
+    -- definite 404 (D-02) from every other failure mode.
+    return nil, code
 end
 
 -- Mirrors downloadFile's file-sink shape (raw bytes to disk), not
@@ -617,7 +619,11 @@ function AudiobookshelfApi:downloadCover(id, local_path)
         pcall(function() outfile:close() end)
         os.remove(local_path)
         logger.warn("AudiobookshelfApi: cannot download cover:", id, ok and (status or code) or "error")
-        return false
+        -- Second value is the numeric HTTP status when the server answered,
+        -- or a transport error string otherwise ("sink timeout", "timeout",
+        -- or the caught error) -- CoverCache uses this to tell a definite
+        -- 404 (D-02) from every other failure mode.
+        return false, code
     end
     return true
 end
