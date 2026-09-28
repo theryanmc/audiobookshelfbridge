@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.0
+
+- Sign in with your Audiobookshelf username and password from Settings instead
+  of typing an API token. The password is never stored; the plugin keeps a
+  session that renews itself and lasts as long as you use it at least once
+  every 30 days (the server's default). Sign out ends the session on the server
+  too when Wi-Fi is connected.
+- Sessions are tied to the server's host name: switching between http and
+  https or changing the port keeps you signed in, a different host signs you
+  out. Plain http still works, with a warning that the password is sent
+  unencrypted once at sign-in.
+- If a sign-in expires and an API token is saved, the plugin switches to the
+  token and tells you once. Test connection now says whether it used your
+  sign-in or your API token.
+- API tokens keep working as before, and existing configuration files need no
+  changes.
+- Download failures now name the real cause (connection, redirect, server,
+  incomplete transfer, or disk), and the "Downloading" message stays up for the
+  whole transfer.
+- A trailing slash in the server URL no longer breaks requests; existing
+  settings are fixed automatically.
+- Missing covers no longer appear in Recent errors, network failures are
+  reported as connection problems, and unexpected server data is skipped
+  instead of crashing.
+- Book details share the cover cache, which now keeps the most recently used
+  covers.
+- Releases are only built when the test suite passes.
+
 ## 0.4.0
 
 - Keep the browser usable when a book's details fail to load; the error message
